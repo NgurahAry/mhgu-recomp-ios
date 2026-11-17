@@ -12,7 +12,7 @@ Port iOS/iPadOS tidak resmi dari **MHGUiOS Recomp**, dikelola oleh **Moka Illust
 
 ## Download / Unduh
 
-Download the stable IPA from the [MHGUiOS Recomp v1.0.0 release](https://github.com/mokaillustra/mhgu-recomp-ios/releases/tag/v1.0.0). IPA stabil tersedia di [rilis MHGUiOS Recomp v1.0.0](https://github.com/mokaillustra/mhgu-recomp-ios/releases/tag/v1.0.0). The IPA contains the app, **not the game data**. GitHub also provides source archives for this release.
+Download the stable IPA from the [MHGUiOS Recomp v1.0.0 release](https://github.com/mokaillustra/mhgu-recomp-ios/releases/tag/v1.0.0). IPA stabil tersedia di [rilis MHGUiOS Recomp v1.0.0](https://github.com/mokaillustra/mhgu-recomp-ios/releases/tag/v1.0.0). The IPA contains the app, **not the game data**. GitHub automatically generates source archives for this release from this tag; the archives contain the full folder structure shown in this repository.
 
 ## Requirements / Persyaratan
 
