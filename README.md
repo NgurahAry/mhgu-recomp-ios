@@ -1,89 +1,137 @@
-<div align="center">
-  <img src="https://www.nintendo.com/eu/media/images/10_share_images/games_15/nintendo_switch_4/H2x1_NSwitch_MonsterHunterGenerationsUltimate_image1600w.jpg" alt="Monster Hunter Generations Ultimate" width="100%">
-</div>
+# MHGUiOS Recomp for iOS and iPadOS
 
-# MHGU Recomp for iOS and iPadOS
+<p align="center">
+  <img src="https://www.nintendo.com/eu/media/images/10_share_images/games_15/nintendo_switch_4/H2x1_NSwitch_MonsterHunterGenerationsUltimate_image1600w.jpg" alt="Monster Hunter Generations Ultimate banner" width="100%">
+</p>
 
-[English installation](#english-installation) | [Panduan instalasi Bahasa Indonesia](#panduan-instalasi-bahasa-indonesia)
+An unofficial iOS/iPadOS port of **MHGUiOS Recomp**, maintained by **Moka Illustra**. This project brings the `gu-native` runtime and iOS platform work together for iPhone and iPad.
 
-An unofficial community iOS/iPadOS port of **MHGU Recomp**, maintained by **Moka Illustra**. It brings the MHGU Recomp runtime and iOS platform work together for iPhone and iPad.
+Port iOS/iPadOS tidak resmi dari **MHGUiOS Recomp**, dikelola oleh **Moka Illustra**, untuk dimainkan di iPhone dan iPad.
 
-Port komunitas tidak resmi **MHGU Recomp** untuk iOS/iPadOS, dikelola oleh **Moka Illustra**. Proyek ini menggabungkan runtime MHGU Recomp dan pekerjaan platform iOS untuk iPhone dan iPad.
+> This is a community project. It is not affiliated with Nintendo or Capcom, and is not an official release from the upstream authors.
 
-This project is not affiliated with Nintendo or Capcom and is not an official release from the upstream authors. It does not include game data. Each player must provide files from their own compatible game copy.
+## Download / Unduh
 
-## What this project brings
+Download the stable IPA from the [MHGUiOS Recomp v1.0.0 release](https://github.com/mokaillustra/mhgu-recomp-ios/releases/tag/v1.0.0). IPA stabil tersedia di [rilis MHGUiOS Recomp v1.0.0](https://github.com/mokaillustra/mhgu-recomp-ios/releases/tag/v1.0.0). The IPA contains the app, **not the game data**. GitHub also provides source archives for this release.
 
-- Touchscreen controls with customizable on-screen layout.
-- Online multiplayer co-op, including a chat panel, friend list, and chat copy/paste tools.
-- iPhone and iPad-focused app integration.
+## Requirements / Persyaratan
 
-## Project and source credits
-
-- [MHGURecomp](https://github.com/morerokk/MHGURecomp) — original recompiler and runtime.
-- [Khorne's gu-native](https://github.com/khorne-hub/gu-native) — source project and mobile runtime work.
-- [MHGURecomp-iOS](https://github.com/cerroverb/MHGURecomp-iOS) — iOS build and platform reference, including earlier iOS contributions credited there.
-- **Moka Illustra** — iOS integration and maintenance of this fork.
-
-## Download
-
-Get the **MHGUiOS Recomp v1.0.0 stable IPA** from the [latest release](https://github.com/mokaillustra/mhgu-recomp-ios/releases/latest). The release also provides a clean source archive. The IPA does not include game data.
-
-## Requirements
-
-- An iPhone or iPad running iOS/iPadOS 15 or later.
+- An iPhone or iPad running iOS/iPadOS 15 or later.  
   iPhone atau iPad dengan iOS/iPadOS 15 atau lebih baru.
-- Your own **Monster Hunter Generations Ultimate v1.4.0** game files.
+- Your own **Monster Hunter Generations Ultimate v1.4.0** game files.  
   File game **Monster Hunter Generations Ultimate v1.4.0** milikmu sendiri.
-- Enough free storage for the app and game data.
-  Ruang penyimpanan yang cukup untuk aplikasi dan data game.
-- An iOS installer that can sign IPA files, or LiveContainer.
-  Aplikasi pemasang iOS yang dapat menandatangani IPA, atau LiveContainer.
+- Enough free device storage for the game data and app.  
+  Ruang penyimpanan yang cukup untuk data game dan aplikasi.
+- An iOS app installer that can sign and install IPA files, or [LiveContainer](https://livecontainer.github.io/docs/installation) set up according to its official guide.  
+  Aplikasi pemasang iOS yang bisa memasang IPA, atau [LiveContainer](https://livecontainer.github.io/docs/installation) yang sudah disiapkan mengikuti panduan resminya.
 
-## Credits and licenses
+## Installation instructions / Petunjuk instalasi
 
-This combined repository does not have one license that replaces the component licenses. Read [LICENSE](LICENSE), [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES), [iOS base license](ios/IOS_BASE_MIT_LICENSE.txt), [iOS port notices](ios/PORT_NOTICES.txt), and the upstream terms before using or redistributing code. Preserve all notices and obtain permissions required by those terms.
+<details>
+<summary>English</summary>
 
----
-
-<details id="english-installation">
-<summary><strong>English — installation guide</strong></summary>
+> **Using a free Apple account?** If SideStore's active-app limit is full or you want to save app slots, we recommend installing the official [LiveContainer + SideStore setup](https://livecontainer.github.io/docs/installation) and importing this IPA as a guest app. You can use [iLoader](https://iloader.app/) as the desktop installer; follow the [iLoader steps in the LiveContainer guide](https://livecontainer.github.io/docs/installation/lc_sidestore) and select **LiveContainer+SideStore**. Use the latest iLoader version. Check SideStore's current guide for account limits. LiveContainer is optional with a paid developer account.
 
 ### Install as a regular app
 
-1. Download the IPA from the [latest release](https://github.com/mokaillustra/mhgu-recomp-ios/releases/latest).
-2. Import it into a trusted installer such as [AltStore](https://faq.altstore.io/) or [SideStore](https://docs.sidestore.io/) and follow its instructions.
-3. Open **MHGUiOS Recomp** once so its folder appears in Files.
+1. Download the IPA from the release linked above.
+2. Import it into a trusted sideloading app such as [AltStore](https://faq.altstore.io/) or [SideStore](https://docs.sidestore.io/), and install it using that app's instructions.
+3. If iOS asks you to trust the signing account or enable Developer Mode, follow the prompts from your installer and iOS Settings.
+4. Open **MHGUiOS Recomp** once. This creates its visible folder in the Files app.
 
-Sideloaded apps may need to be refreshed or re-signed. If you use a free Apple Developer account and have reached SideStore's active-app limit, use LiveContainer to avoid another app slot. [iLoader](https://iloader.app/) is a convenient way to install SideStore and LiveContainer; see the [iLoader setup guide](https://livecontainer.github.io/docs/installation/lc_sidestore).
+Sideloaded apps may need to be refreshed or re-signed by the installer. Refer to the installer's current documentation for those steps.
 
-### Install with LiveContainer
+### Run it with LiveContainer
 
-1. Install and configure [LiveContainer](https://livecontainer.github.io/docs/installation) using its official guide.
-2. In LiveContainer, tap **+** and import the MHGU Recomp IPA. Launch it once.
-3. Long-press its app card, open **Settings → Container**, then tap **Open Data Folder**. Put game data in the guest app's **Documents** folder.
+1. Install and configure the official [LiveContainer](https://livecontainer.github.io/docs/installation) build by following its guide.
+2. Open LiveContainer, tap **+**, and import the MHGUiOS Recomp IPA.
+3. Launch MHGUiOS Recomp once from LiveContainer.
+4. To locate its files, long-press the app in LiveContainer, open **Settings → Container**, then tap **Open Data Folder**. Open that container's `Documents` folder.
 
-Place your own v1.4.0 game files in `data/`, with `exefs/` and `romfs/` directly inside. Do not upload or share game files, keys, or generated game code.
+LiveContainer keeps app data in its own container. Do not put the game data beside the IPA or inside the app bundle. If the Files app does not show the container folder as expected, use the in-game **Settings → System → Game folder** picker and select the folder that directly contains `exefs/` and `romfs/`.
+
+### Add your game files
+
+Use files from your own legally obtained v1.4.0 game copy. Do not upload game files, keys, or generated game code to this repository or share them with the IPA.
+
+On a regular installation, the default location is **Files → On My iPad/iPhone → MHGUiOS Recomp → `data/`**. Under LiveContainer, place `data/` inside the guest app's `Documents` folder. The expected layout is:
+
+```text
+Documents/
+└── data/
+    ├── exefs/
+    │   ├── main
+    │   ├── main.npdm
+    │   └── sdk/                 (if present in your dump)
+    └── romfs/
+        └── ...                  (all v1.4.0 RomFS folders and files)
+```
+
+The `exefs/` and `romfs/` folders must sit directly inside `data/`. The app checks that `exefs/main` is from v1.4.0 and that RomFS is complete (about 35,531 files). If the app opens its missing-files screen, add the files and tap **Check Files Again**.
+
+You can choose another accessible folder from **Settings → System → Game folder**. Select the folder that directly contains `exefs/` and `romfs/`; the change takes effect the next time the game starts.
 
 </details>
 
-<details id="panduan-instalasi-bahasa-indonesia">
-<summary><strong>Bahasa Indonesia — panduan instalasi</strong></summary>
+<details>
+<summary>Bahasa Indonesia</summary>
+
+> **Menggunakan akun Apple gratis?** Jika batas aplikasi aktif SideStore sudah penuh atau kamu ingin menghemat slot aplikasi, kami menyarankan memasang [LiveContainer + SideStore resmi](https://livecontainer.github.io/docs/installation), lalu mengimpor IPA ini sebagai aplikasi guest. Kamu bisa menggunakan [iLoader](https://iloader.app/) sebagai alat pemasangan dari komputer; ikuti [langkah iLoader di panduan LiveContainer](https://livecontainer.github.io/docs/installation/lc_sidestore) dan pilih **LiveContainer+SideStore**. Gunakan iLoader versi terbaru. Periksa panduan SideStore terbaru untuk batas akun. LiveContainer opsional jika kamu memiliki akun Apple Developer berbayar.
 
 ### Memasang sebagai aplikasi biasa
 
-1. Unduh IPA dari [rilis terbaru](https://github.com/mokaillustra/mhgu-recomp-ios/releases/latest).
-2. Impor ke aplikasi tepercaya seperti [AltStore](https://faq.altstore.io/) atau [SideStore](https://docs.sidestore.io/), lalu ikuti petunjuknya.
-3. Buka **MHGUiOS Recomp** satu kali agar foldernya muncul di Files.
+1. Unduh IPA dari rilis di atas.
+2. Impor IPA ke aplikasi sideload tepercaya seperti [AltStore](https://faq.altstore.io/) atau [SideStore](https://docs.sidestore.io/), lalu pasang mengikuti petunjuk aplikasi tersebut.
+3. Jika iOS meminta untuk memercayai akun penanda tangan atau mengaktifkan Developer Mode, ikuti petunjuk dari aplikasi pemasang dan Pengaturan iOS.
+4. Buka **MHGUiOS Recomp** satu kali agar foldernya muncul di aplikasi Files.
 
-Aplikasi sideload mungkin perlu diperbarui masa aktifnya atau ditandatangani ulang. Jika akun Apple Developer gratis milikmu sudah mencapai batas aplikasi aktif SideStore, gunakan LiveContainer agar tidak memakai slot aplikasi tambahan. [iLoader](https://iloader.app/) memudahkan pemasangan SideStore dan LiveContainer; lihat [panduan penyiapan iLoader](https://livecontainer.github.io/docs/installation/lc_sidestore).
+Aplikasi sideload mungkin perlu diperbarui masa aktifnya atau ditandatangani ulang melalui aplikasi pemasang. Ikuti dokumentasi terbaru aplikasi yang kamu gunakan.
 
-### Memasang dengan LiveContainer
+### Menjalankan dengan LiveContainer
 
-1. Pasang dan siapkan [LiveContainer](https://livecontainer.github.io/docs/installation) mengikuti panduan resminya.
-2. Di LiveContainer, ketuk **+**, impor IPA MHGU Recomp, lalu jalankan satu kali.
-3. Tekan lama kartu aplikasinya, buka **Settings → Container**, lalu ketuk **Open Data Folder**. Letakkan data game di folder **Documents** milik aplikasi guest.
+1. Pasang dan siapkan build resmi [LiveContainer](https://livecontainer.github.io/docs/installation) mengikuti panduan resminya.
+2. Buka LiveContainer, ketuk **+**, lalu impor IPA MHGUiOS Recomp.
+3. Jalankan MHGUiOS Recomp satu kali dari LiveContainer.
+4. Untuk menemukan folder datanya, tekan lama kartu aplikasi di LiveContainer, buka **Settings → Container**, lalu ketuk **Open Data Folder**. Buka folder `Documents` milik container itu.
 
-Letakkan file game v1.4.0 milikmu sendiri di `data/`, dengan `exefs/` dan `romfs/` berada langsung di dalamnya. Jangan mengunggah atau membagikan file game, key, maupun kode game hasil kompilasi.
+LiveContainer menyimpan data aplikasi di containernya sendiri. Jangan menaruh file game di samping IPA atau di dalam bundle aplikasi. Jika folder container tidak terlihat seperti yang diharapkan di Files, gunakan pemilih **Settings → System → Game folder** di dalam game dan pilih folder yang langsung berisi `exefs/` dan `romfs/`.
+
+### Menambahkan file game
+
+Gunakan file dari salinan game v1.4.0 milikmu sendiri yang diperoleh secara sah. Jangan unggah file game, key, atau kode game hasil kompilasi ke repo ini atau membagikannya bersama IPA.
+
+Pada pemasangan biasa, lokasi default-nya adalah **Files → On My iPad/iPhone → MHGUiOS Recomp → `data/`**. Di LiveContainer, letakkan `data/` di dalam folder `Documents` milik aplikasi guest. Susunan yang diharapkan:
+
+```text
+Documents/
+└── data/
+    ├── exefs/
+    │   ├── main
+    │   ├── main.npdm
+    │   └── sdk/                 (jika ada di dump milikmu)
+    └── romfs/
+        └── ...                  (semua folder dan file RomFS v1.4.0)
+```
+
+Pastikan folder `exefs/` dan `romfs/` berada langsung di dalam `data/`. Aplikasi memeriksa apakah `exefs/main` berasal dari v1.4.0 dan apakah RomFS lengkap (sekitar 35.531 file). Jika muncul layar file belum lengkap, tambahkan file yang diperlukan lalu ketuk **Check Files Again**.
+
+Kamu juga bisa memilih folder lain melalui **Settings → System → Game folder**. Pilih folder yang langsung berisi `exefs/` dan `romfs/`; perubahan berlaku setelah game dimulai ulang.
 
 </details>
+
+## Credits and licenses
+
+This iOS fork preserves credit for the projects and contributors it builds on:
+
+- [MHGURecomp](https://github.com/morerokk/MHGURecomp) — original recompiler and runtime.
+- [Khorne's `gu-native`](https://github.com/khorne-hub/gu-native) — source project and mobile runtime work.
+- [MHGURecomp-iOS](https://github.com/cerroverb/MHGURecomp-iOS) — iOS build and platform reference, including earlier iOS contributions credited in that project.
+- iOS integration and this fork are maintained by **Moka Illustra**.
+
+This combined repository does not have one license that replaces the component licenses. Read [LICENSE](LICENSE), [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES), [ios/IOS_BASE_MIT_LICENSE.txt](ios/IOS_BASE_MIT_LICENSE.txt), [ios/PORT_NOTICES.txt](ios/PORT_NOTICES.txt), and upstream license terms before using or redistributing code. Preserve each project's notices and obtain any permissions required by those terms.
+
+## Building / Build
+
+The iOS IPA is built by [the GitHub Actions workflow](.github/workflows/build-ios.yml). A successful app build does not supply game data; each player must provide their own compatible files.
+
+IPA iOS dibuat melalui [workflow GitHub Actions](.github/workflows/build-ios.yml). Build aplikasi tidak menyertakan file game; setiap pemain harus menyediakan file kompatibel miliknya sendiri.
