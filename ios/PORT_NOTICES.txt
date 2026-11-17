@@ -1,0 +1,6 @@
+This personal iOS adaptation combines the Khorne MHGU Recomp source with iOS platform/build files from:
+https://github.com/cerroverb/MHGURecomp-iOS
+
+The copied iOS baseline files are covered by ios/IOS_BASE_MIT_LICENSE.txt (Copyright (c) 2026 Rokk).
+The Khorne project license and all third-party notices remain applicable to their respective source files.
+No game data or keys are part of this source tree except generated/ when it is created locally from the owner's dump.

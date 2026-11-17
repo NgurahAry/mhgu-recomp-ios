@@ -1,0 +1,24 @@
+// Controller state the game reads (runtime/hle/input.c), set by the window loop.
+#pragma once
+#include <stdbool.h>
+#include <stdint.h>
+
+// Switch button bits (NpadButton): A 0, B 1, X 2, Y 3, LStick 4, RStick 5, L 6, R 7, ZL 8, ZR 9, Plus 10, Minus 11,
+// Left 12, Up 13, Right 14, Down 15. Sticks: -32767..32767, y up.
+enum { BTN_A, BTN_B, BTN_X, BTN_Y, BTN_LSTICK, BTN_RSTICK, BTN_L, BTN_R, BTN_ZL, BTN_ZR, BTN_PLUS, BTN_MINUS,
+       BTN_LEFT, BTN_UP, BTN_RIGHT, BTN_DOWN };
+void input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry);
+// Of the next input_set's buttons, those the touch controls' menu pad alone presses (its d-pad, its tabs, a drag's step
+// in a menu; not held by a key or a controller too): the game reads them only while a menu takes input
+// (menu_takes_input, hle/mousemenu.c) - a d-pad press reaching the hunter as a menu closes is a Hunter Art
+void input_stage_menu_only(uint64_t buttons);
+// (the game's thread) of what the game read last, the menu pad's buttons not given to it as the d-pad (no menu's cursor
+// ran: hle/mousemenu.c writes them into the menu's half of the game's pad, which no hunter reads)
+uint64_t input_menu_held_back(void);
+void input_get(uint64_t *buttons, int32_t sticks[4]);  // the controller state the game sees
+uint64_t input_npad_state(int32_t sticks[4]);  // what GetNpadState gives player 1: buttons (stick directions too), sticks
+extern volatile uint64_t g_a_pressed_ns;  // when A was last pressed (plat_now_ns; 0: never)
+// Rumble the game asks for (hid SendVibrationValues, runtime/services/misc.c): low / high frequency motor strength,
+// 0..65535 each, for the window loop to send to the controller (runtime/host_input.c).
+void input_set_rumble(uint16_t low, uint16_t high);
+uint32_t input_rumble(void);  // low << 16 | high

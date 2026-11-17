@@ -1,0 +1,230 @@
+// Vulkan 1.2 backend for the NVN layer. Baseline: what an AMD GCN card with a 2020 driver offers (see
+// docs/STATUS.md): no dynamic rendering, no synchronization2, no extended dynamic state, no push descriptors.
+// Files: device.c (instance, device, swapchain, presentation), textures.c (images, change-detected uploads from
+// guest memory, views, samplers), shaders.c (GLSL -> SPIR-V, reflection, built-in shaders), exec.c (command lists:
+// render passes, draws, clears, copies, compute). Structure and behaviour follow LAS Recomp's Vulkan backend.
+//
+// Synchronisation model: every image lives in VK_IMAGE_LAYOUT_GENERAL, and a full memory barrier separates render
+// passes, copies and dispatches. Render passes are VkRenderPass objects (cached by attachment formats; LOAD / STORE,
+// GENERAL in and out) with framebuffers cached by their views. Pipelines bake all state but viewport, scissor, depth
+// bias, blend constants and stencil masks / reference. Submissions are numbered; a timeline semaphore signals each
+// number, which is what NVN fences (renderer_fence_seq / renderer_wait_seq) wait for.
+#pragma once
+#include <stdbool.h>
+#include <stdint.h>
+#include <vulkan/vulkan.h>
+#if __has_include(<vma/vk_mem_alloc.h>)
+#include <vma/vk_mem_alloc.h>
+#else
+#include <vk_mem_alloc.h>
+#endif
+
+#include "../../config.h"
+#include "../nvn.h"
+#include "../maxwell/shader.h"
+
+#define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) FATAL("%s failed: %d (%s:%d)\n", #x, r_, __FILE__, __LINE__); } while (0)
+
+#define VK_SC_MAX 64  // window images: a driver can make more than it was asked for (seen: a Mali-G57 MC2)
+typedef struct {
+    VkInstance inst;
+    VkPhysicalDevice phys;
+    VkDevice dev;
+    VkQueue queue;
+    uint32_t qfam;
+    VmaAllocator vma;
+    VkPhysicalDeviceProperties props;
+    VkPipelineCache pcache;
+    VkSemaphore timeline;      // value = last completed submission number (none on a Vulkan 1.1 driver: fences, exec.c)
+    bool api12, has_timeline;  // the device works as Vulkan 1.2 or later; it has timeline semaphores
+    bool mirror_clamp;         // the mirror-clamp sampler mode can be used
+    VkCommandPool pool;        // render thread only
+    bool divisor, demote, custom_border, depth_clamp, stencil_export, sample_shading;
+    volatile uint32_t msaa;    // samples for the 3D scene's passes (settings MSAA, as far as the GPU allows): 1 = off
+    uint32_t msaa_counts;      // the sample counts MSAA can use (bits 2, 4, 8)
+    bool fsr_fp16, fsr_storage_wo_format;  // FSR (fsr.c): shaderFloat16 / shaderStorageImageWriteWithoutFormat enabled
+    bool creation_feedback;    // VK_EXT_pipeline_creation_feedback: a pipeline build says whether the driver's cache had it
+    // window
+    VkSurfaceKHR surface;
+    VkSwapchainKHR swapchain;
+    VkFormat sc_format;
+    VkExtent2D sc_extent;
+    uint32_t sc_count;
+    VkImage sc_images[VK_SC_MAX];
+    VkImageView sc_views[VK_SC_MAX];
+} VkG;
+extern VkG g_vk;
+
+// One lock for everything that records or submits (the game may submit from more than one thread).
+void vk_lock(void);
+void vk_unlock(void);
+
+// The driver's pipeline cache written to cache/vk_pipelines.bin now (any thread; one write at a time): its size in KB,
+// 0 if nothing was written. device.c also writes it when the app goes to the background and at exit.
+size_t vk_pipeline_cache_save(void);
+
+// exit() has begun (set by device.c's atexit handler): driver calls are no longer safe, the process leaves
+// through _exit. Late guest threads park at vk_lock and drop their GPU waits.
+bool vk_exiting(void);
+
+// ---- submissions (exec.c)
+// Work is recorded into the current command buffer; uploads go into a separate one that runs first.
+VkCommandBuffer vk_cmd(void);         // current command buffer (outside any render pass unless exec.c began one)
+VkCommandBuffer vk_upload_cmd(void);  // upload command buffer of the pending submission
+uint64_t vk_pending_seq(void);        // number the pending submission will get
+uint64_t vk_completed_seq(void);
+void vk_wait_seq(uint64_t seq);
+void vk_full_barrier(VkCommandBuffer cb);
+void vk_end_pass(void);
+
+// Barriers name every stage and access type explicitly: AMD's 2020 Windows driver for GCN1 (R9 200) does not flush the
+// colour-attachment cache for a barrier that only says ALL_COMMANDS / MEMORY_WRITE, so later passes read stale 8x8
+// tiles of the image just rendered (the light-shaft "triangle" and blocky bloom shimmer).
+#define VK_STAGES_ALL                                                                                                     \
+    (VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |     \
+     VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | \
+     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |                           \
+     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
+#define VK_ACCESS_ALL_WRITES                                                                                         \
+    (VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | \
+     VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT)
+#define VK_ACCESS_ALL                                                                                                     \
+    (VK_ACCESS_ALL_WRITES | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |                            \
+     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT |               \
+     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |                       \
+     VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT)
+void vk_submit_extra(VkSemaphore wait, VkSemaphore signal);  // submit (with binary semaphores for presentation)
+void vk_upload_jobs_finish(void);  // (textures.c) the texture upload workers' staging writes done: before a submission
+// (textures.c) the CPU about to write guest memory mid-list: the texture bands still to read any of it done first
+void vk_upload_jobs_guard(uint64_t addr, uint64_t size, const char *what);
+
+// Transient GPU-visible memory that lives until the submission it was allocated for completes.
+typedef struct { VkBuffer buf; uint64_t off; void *ptr; } VkSpan;
+VkSpan vk_transient(uint64_t size, uint64_t align);
+VkSpan vk_transient_copy(const void *data, uint64_t size, uint64_t align);
+VkSpan vk_readback(uint64_t size);  // host-cached GPU -> CPU staging (read right after the copy completes)
+VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout);
+
+// Render passes / framebuffers (exec.c): all attachments LOAD / STORE in GENERAL layout (samples > 1, MSAA: in the
+// attachment layouts). depth: the depth/stencil format (UNDEFINED: none).
+VkRenderPass vk_render_pass(const VkFormat *color, uint32_t ncolor, VkFormat depth, uint32_t samples);
+VkFormat vk_depth24_stencil8(void);  // the format DEPTH24_STENCIL8 is made as (D32_SFLOAT_S8_UINT on AMD)
+VkFramebuffer vk_framebuffer(VkRenderPass rp, const VkImageView *views, uint32_t n, uint32_t w, uint32_t h);
+void vk_framebuffers_forget_view(VkImageView v);  // (textures.c: a view is going away)
+
+// ---- textures (textures.c)
+typedef struct TexBackend {
+    VkImage image;
+    VmaAllocation mem;
+    VkFormat format;
+    VkImageViewType base_type;
+    uint32_t width, height, depth, layers, levels, samples;
+    VkImageAspectFlags aspect;
+    bool gpu_owned, uploaded, dynamic;
+    uint64_t data_hash, sample_hash, checked_frame, full_frame;
+    uint64_t full_t;     // (textures.c: MHGU_PERF_TEXNET, MHGU_TEX_NET_CHECK) when its last whole hash was, in ns
+    uint32_t wgen;       // page write tracking generation at the last upload check
+    uint32_t hash_gen;   // (MHGU_TEX_NET_CHECK) and at its last whole hash
+    uint32_t chg_run;    // (textures.c: MHGU_PERF_TEXSTREAM) checks in a row that found its contents changed
+    bool presented;
+    void *pending_rgba;  // host-produced pixels waiting to be uploaded on the render thread
+    uint32_t pending_w, pending_h, pending_stride;
+    uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
+    bool astc_srgb;
+    uint8_t bcn;               // BCn without GPU support (phones): decoded on upload (runtime/nvn/bcn.c), BCN_* kind
+    uint8_t bcn_tb;            // the bytes of its decoded texels
+    uint8_t mip_skip;          // top levels not kept (low_memory_textures): width, height and levels stay the game's
+    struct TexBackend *ms;  // MSAA: the multisampled image this one is rendered through (textures.c vk_tex_ms)
+    bool ms_valid;          // ms holds this image's contents (its last write was a pass through ms)
+    bool ms_dirty;          // ms is newer than this image: resolved when this one is next read (exec.c vk_ms_resolve)
+    VkFormat ms_fmt;        // the format ms is rendered as
+    bool wide;              // RGBA16 UNORM standing in for the game's RGBA8 render target (textures.c vk_rt_widen)
+    uint64_t ms_models;     // (colour) the frame 3D models (depth-writing draws) were last drawn into this image, once
+                            // a pass without MSAA did (g_present_count; menus: exec.c ms_expand), 0 none lately
+    uint64_t up_last;       // the frame its contents last changed and were uploaded again
+    uint32_t up_run;        // how many frames in a row they did (textures.c say_every_frame)
+    bool up_said;
+    uint32_t shadow_off_gen;  // ([Performance] Shadows Off) a shadow atlas cleared once: when (exec.c shadow_skipped)
+    VkImage shadow_off_image; // (and which image it had then)
+    bool stand_in;            // no image of the texture's own (textures.c stand_in): 1x1, never uploaded to or rendered into
+} TexBackend;
+
+bool vk_wide_rt_on(void);  // (textures.c) RGBA8 render targets as RGBA16 UNORM ([Graphics] SmoothGradients)
+void vk_rt_widen(NvnTexture *t, bool wide);  // (exec.c begin_pass, outside a render pass)
+
+TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
+VkFormat vk_format(uint32_t nvn_format);
+bool vk_format_alpha_one(uint32_t nvn_format);
+bool renderer_format_is_depth(uint32_t f);
+bool renderer_format_has_stencil(uint32_t f);
+void renderer_mark_gpu_owned(NvnTexture *t);
+void renderer_mark_dynamic(NvnTexture *t);  // its CPU-written contents change often: checked every frame
+// View of t (optionally through an NVN texture view) for rendering or sampling.
+VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype);
+VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
+                          uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
+VkImageView vk_dummy_view(int textype);
+TexBackend *vk_tex_ms(TexBackend *b, uint32_t samples);  // b's multisampled companion (created on first use)
+TexBackend *vk_tex_ms_readable(TexBackend *m);  // a sampled copy for its resolve
+void vk_ms_resolve(TexBackend *b);  // (exec.c) b up to date with its multisampled companion before b is read
+VkSampler vk_sampler(NvnSamplerDesc *d);
+VkSampler vk_default_sampler(bool linear);
+void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect);
+// Destruction once every submission that may use the object has completed.
+void vk_defer_image(VkImage img, VmaAllocation mem);
+void vk_defer_view(VkImageView v);
+void vk_defer_framebuffer(VkFramebuffer f);
+void vk_defer_buffer(VkBuffer b, VmaAllocation mem);
+void vk_collect_dead(void);
+void vk_views_forget(TexBackend *b);  // drop (deferred) the cached views of an image being replaced
+uint64_t vk_frame_counter(void);
+// Guest memory [addr, addr + size) (guest addresses) changed since generation `since`? 0 no, 1 yes, -1 unknown.
+int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
+
+// ---- shaders (shaders.c)
+VkShaderModule vk_compile_glsl(const char *src, int stage, const char *name);  // NULL on failure (logged)
+VkShaderModule vk_builtin_shader(const char *name);  // internal shaders (clear, present)
+
+// ---- device / window (device.c)
+// Images and buffers only the GPU uses (textures, render targets, the vertex cache): vmaCreateImage / vmaCreateBuffer
+// in device memory (VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE), from the memory set aside at start-up when they fit there
+// (desktop). Freed with vmaDestroyImage / vmaDestroyBuffer as before.
+VkResult vk_create_image(const VkImageCreateInfo *ci, VkImage *img, VmaAllocation *mem);
+VkResult vk_create_buffer(const VkBufferCreateInfo *bi, VkBuffer *buf, VmaAllocation *mem);
+void vk_image_bytes_add(int64_t n);                              // (device.c: the [mem] line's images)
+int64_t vk_bcn_bytes(void);                                      // (textures.c: of those, textures decoded on the CPU)
+uint64_t vk_ram_mb(void);                                        // (textures.c: the device's memory, MHGU_RAM_MB to test)
+VkFormatFeatureFlags vk_format_features(VkFormat f);             // (textures.c: optimal tiling, MHGU_VK_FMT_MASK applied)
+VkImageUsageFlags vk_usage_supported(VkFormat f, VkImageUsageFlags usage);  // (textures.c: usage the format has)
+void vk_exec_mem(uint64_t *staging, int *chunks, uint64_t *vc);  // (exec.c: the staging ring's and vertex cache's bytes)
+void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);
+// The devices that can run the game (Vulkan 1.1; one per name, in the driver's order) and which of them runs it (-1:
+// none yet), for the settings' GPU row ([Display] GPU, settings_panel.cpp): their count, 0 before the device is made
+int vk_gpu_list(const char **names, int max, int *in_use);
+// A PowerVR (or MHGU_VK_POWERVR=1): one driver compile at a time, on one worker (device.c one_compiler_install)
+bool vk_gpu_powervr(void);
+bool vk_shader_progress(int *done, int *total);  // (exec.c) the start's shader builds not done yet, and how far: the overlay's plate
+// An Arm Mali (MHGU_VK_MALI=1 / 0 for tests)
+bool vk_gpu_mali(void);
+// Which of 0.1.9's render switches are on by default (each MHGU_PERF_<NAME> still overrides its own): all of them with a
+// Vulkan 1.2 driver or an Adreno's 1.1, none with a Mali's 1.1, IPA alone with another 1.1 driver (device.c)
+enum { V11_ALL, V11_NONE, V11_IPA };
+int vk_v11_switches(void);
+// What an SDK that looks the device's functions up itself gets as its getDeviceProcAddr (FSR 3.1, FSR 4):
+// vkGetDeviceProcAddr, or on a PowerVR one whose compiler functions take the one-compile-at-a-time lock
+PFN_vkGetDeviceProcAddr vk_device_proc_addr(void);
+#ifdef __ANDROID__
+// Presents timed to the display's vsyncs at an FPS limit that is a whole fraction of its rate (present_pacing.c,
+// MHGU_PERF_PRESENT_TIME=1): the device extension (create_device), its functions once the device is made, a swapchain
+// made, whether the swapchain should be FIFO with timed presents now, and the present's time (before vkQueuePresentKHR)
+bool vk_pacing_device_ext(const VkExtensionProperties *ep, uint32_t ne);
+void vk_pacing_device(void);
+void vk_pacing_swapchain(void);
+bool vk_pacing_fifo(void);
+void vk_pacing_present(VkPresentInfoKHR *pi, bool new_frame);
+#endif
+#ifdef _WIN32
+// The picked device's LUID, which Windows' own GPU figures go by (the performance readout: platform/win_stats.c, any
+// thread); false: no device yet, or its driver gives none
+bool vk_device_luid(uint8_t luid[8]);
+#endif

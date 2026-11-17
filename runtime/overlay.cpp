@@ -1,0 +1,1134 @@
+// Forge's ImGui overlay: its "forge" window (About, Loaded Plugins, Plugin UI: each plugin's settings) and whatever
+// plugins draw every frame. On the console Forge draws it with its own NVN renderer onto the image about to be shown;
+// here Dear ImGui's Vulkan backend draws it into the window image, over the game (runtime/nvn/vulkan/device.c).
+//
+// Threads:
+//   - the game's thread builds the frame (runtime/forge.c's frame update, after the plugins' forge_onUpdate): the
+//     plugins' ImGui code runs there (their calls: runtime/forge_imgui.c); texture uploads too, under the Vulkan lock
+//   - the render thread draws a copy of the last frame's draw lists (taken under a lock of its own, so it never
+//     waits for plugin code)
+//   - the host's main thread passes input on: while the menu is open, keyboard and mouse go to ImGui, and the
+//     controller moves through the menu (runtime/host_input.c then gives the game none)
+// The menu opens and closes with the key of Forge's config (nativeNX/forge/config.ini [menu] key; Insert by default).
+#include <algorithm>
+#include <atomic>
+#include <cfloat>
+#include <cstdio>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include <unistd.h>  // access
+
+#include "imgui.h"
+#include "imgui_internal.h"  // (GImGui's ActiveIdWindow: Forge's menu scrolled by a drag, frame_once)
+#ifndef MHGU_NULL_BACKEND
+#include "backends/imgui_impl_vulkan.h"
+#else  // (no renderer: no overlay)
+struct ImGui_ImplVulkan_InitInfo { int unused; };
+static void ImGui_ImplVulkan_NewFrame() {}
+static void ImGui_ImplVulkan_UpdateTexture(ImTextureData *) {}
+#endif
+
+#include "chat_port.h"
+#include "config.h"
+#include "touch.h"
+#include "forge.h"
+#include "hitchlog.h"
+#include "logwriter.h"
+#include "menu_confirm.h"
+#include "overlay.h"
+#include "perfstats.h"
+#include "platform.h"
+#include "hle/chat.h"
+#include "settings_locale.h"
+#include "settings_panel.h"
+
+#define LOG(...) rt_logf(__VA_ARGS__)  // (Windows: queued, the log's own thread writes it)
+
+extern "C" {
+void vk_lock(void);
+void vk_unlock(void);
+SDL_Window *ui_window(void);
+void vi_pause_game(void);
+bool romfs_incomplete(double *gb, int *empty);  // (romfs.c)
+}
+
+static std::atomic<bool> g_enabled, g_ready, g_open;
+static std::atomic<bool> g_settings_open, g_forge_open;
+// Forge's menu opened by its row in the Mods tab (overlay_open_forge): it opens once the settings menu has closed.
+// g_forge_touch: opened by touch, it is drawn bigger for fingers and a drag scrolls it (frame_once).
+// g_forge_typing: a field of it takes text (ImGui's WantTextInput): the phone's keyboard comes up (textinput.c).
+static std::atomic<bool> g_forge_pending, g_forge_touch, g_forge_typing;
+static std::atomic<bool> g_modal_open;  // (the thank-you, settings_panel.cpp: a menu as far as input goes, until it is closed)
+static int g_menu_key;
+static float g_font_size;
+static ImGuiStyle g_base_style;  // (unscaled; scaled copies follow the window's height)
+static float g_scale;
+// MHGU_PERF_OVERLAY_REUSE (read once, overlay_init): 1 frames of the touch controls alone that would come out the same
+// are not built again; 2 they are, and compared (a check); 0 every frame built (1, the default)
+static int g_perf_overlay_reuse;
+static bool g_reuse_last;  // (the frame built last had the touch controls alone, and uploaded no texture)
+static uint32_t g_reuse_w, g_reuse_h;
+static uint64_t g_reuse_built_ns, g_reuse_log_ns, g_reuse_n[2];
+static int g_reuse_bad;
+#ifdef __ANDROID__
+// While the settings menu holds the game, the held picture is presented again only when the menu's frame changed
+// (snap_same), when the window needs one (back from the background, a new size: vk_present_needed) and once a second;
+// the menu is still built 60 times a second, so it moves as before (the default since 1.0: on the Anbernic, the app's
+// CPU with the menu open 29% lower, the same picture). MHGU_PERF_MENU_PRESENT=0: every pass, as before
+static bool g_perf_menu_present = true, g_perf_menu_log;  // (log: the hold's presents counted, at each close)
+#endif
+
+// ------------------------------------------------------------------ input (main thread -> game thread)
+struct Ev {
+    enum { POS, BUTTON, WHEEL, KEY, TEXT, FOCUS, CLEAR } kind;
+    bool down;
+    bool touch;  // (POS, BUTTON: a finger's - ImGui then knows there was no hover before it, and none after it lifts)
+    int button;
+    float x, y;
+    ImGuiKey key;
+    SDL_Keymod mods;
+    char text[32];
+};
+static std::mutex g_in_lock;
+static std::vector<Ev> g_in;
+static OverlayPad g_pad;
+
+static void queue(const Ev &e) {
+    std::lock_guard<std::mutex> l(g_in_lock);
+    if (g_in.size() < 4096) g_in.push_back(e);
+}
+
+static ImGuiKey key_of(SDL_Scancode sc, SDL_Keycode kc) {
+    if (kc >= SDLK_A && kc <= SDLK_Z) return (ImGuiKey)(ImGuiKey_A + (int)(kc - SDLK_A));  // (letters as labelled)
+    if (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_Z) return (ImGuiKey)(ImGuiKey_A + (sc - SDL_SCANCODE_A));
+    if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9) return (ImGuiKey)(ImGuiKey_1 + (sc - SDL_SCANCODE_1));
+    if (sc >= SDL_SCANCODE_F1 && sc <= SDL_SCANCODE_F12) return (ImGuiKey)(ImGuiKey_F1 + (sc - SDL_SCANCODE_F1));
+    if (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_9) return (ImGuiKey)(ImGuiKey_Keypad1 + (sc - SDL_SCANCODE_KP_1));
+    switch (sc) {
+    case SDL_SCANCODE_0: return ImGuiKey_0;
+    case SDL_SCANCODE_TAB: return ImGuiKey_Tab;
+    case SDL_SCANCODE_LEFT: return ImGuiKey_LeftArrow;
+    case SDL_SCANCODE_RIGHT: return ImGuiKey_RightArrow;
+    case SDL_SCANCODE_UP: return ImGuiKey_UpArrow;
+    case SDL_SCANCODE_DOWN: return ImGuiKey_DownArrow;
+    case SDL_SCANCODE_PAGEUP: return ImGuiKey_PageUp;
+    case SDL_SCANCODE_PAGEDOWN: return ImGuiKey_PageDown;
+    case SDL_SCANCODE_HOME: return ImGuiKey_Home;
+    case SDL_SCANCODE_END: return ImGuiKey_End;
+    case SDL_SCANCODE_INSERT: return ImGuiKey_Insert;
+    case SDL_SCANCODE_DELETE: return ImGuiKey_Delete;
+    case SDL_SCANCODE_BACKSPACE: return ImGuiKey_Backspace;
+    case SDL_SCANCODE_SPACE: return ImGuiKey_Space;
+    case SDL_SCANCODE_RETURN: return ImGuiKey_Enter;
+    case SDL_SCANCODE_ESCAPE: return ImGuiKey_Escape;
+    case SDL_SCANCODE_AC_BACK: return ImGuiKey_AppBack;  // (Android's Back: the settings menu's Back)
+    case SDL_SCANCODE_APOSTROPHE: return ImGuiKey_Apostrophe;
+    case SDL_SCANCODE_COMMA: return ImGuiKey_Comma;
+    case SDL_SCANCODE_MINUS: return ImGuiKey_Minus;
+    case SDL_SCANCODE_PERIOD: return ImGuiKey_Period;
+    case SDL_SCANCODE_SLASH: return ImGuiKey_Slash;
+    case SDL_SCANCODE_SEMICOLON: return ImGuiKey_Semicolon;
+    case SDL_SCANCODE_EQUALS: return ImGuiKey_Equal;
+    case SDL_SCANCODE_LEFTBRACKET: return ImGuiKey_LeftBracket;
+    case SDL_SCANCODE_BACKSLASH: return ImGuiKey_Backslash;
+    case SDL_SCANCODE_RIGHTBRACKET: return ImGuiKey_RightBracket;
+    case SDL_SCANCODE_GRAVE: return ImGuiKey_GraveAccent;
+    case SDL_SCANCODE_CAPSLOCK: return ImGuiKey_CapsLock;
+    case SDL_SCANCODE_SCROLLLOCK: return ImGuiKey_ScrollLock;
+    case SDL_SCANCODE_NUMLOCKCLEAR: return ImGuiKey_NumLock;
+    case SDL_SCANCODE_PRINTSCREEN: return ImGuiKey_PrintScreen;
+    case SDL_SCANCODE_PAUSE: return ImGuiKey_Pause;
+    case SDL_SCANCODE_KP_0: return ImGuiKey_Keypad0;
+    case SDL_SCANCODE_KP_PERIOD: return ImGuiKey_KeypadDecimal;
+    case SDL_SCANCODE_KP_DIVIDE: return ImGuiKey_KeypadDivide;
+    case SDL_SCANCODE_KP_MULTIPLY: return ImGuiKey_KeypadMultiply;
+    case SDL_SCANCODE_KP_MINUS: return ImGuiKey_KeypadSubtract;
+    case SDL_SCANCODE_KP_PLUS: return ImGuiKey_KeypadAdd;
+    case SDL_SCANCODE_KP_ENTER: return ImGuiKey_KeypadEnter;
+    case SDL_SCANCODE_KP_EQUALS: return ImGuiKey_KeypadEqual;
+    case SDL_SCANCODE_LCTRL: return ImGuiKey_LeftCtrl;
+    case SDL_SCANCODE_LSHIFT: return ImGuiKey_LeftShift;
+    case SDL_SCANCODE_LALT: return ImGuiKey_LeftAlt;
+    case SDL_SCANCODE_LGUI: return ImGuiKey_LeftSuper;
+    case SDL_SCANCODE_RCTRL: return ImGuiKey_RightCtrl;
+    case SDL_SCANCODE_RSHIFT: return ImGuiKey_RightShift;
+    case SDL_SCANCODE_RALT: return ImGuiKey_RightAlt;
+    case SDL_SCANCODE_RGUI: return ImGuiKey_RightSuper;
+    case SDL_SCANCODE_APPLICATION: return ImGuiKey_Menu;
+    default: return ImGuiKey_None;
+    }
+}
+
+static void set_open(bool open) {
+    g_forge_open = open;
+    g_open = open || g_settings_open || g_modal_open;
+    SDL_Window *w = ui_window();
+    if (g_open) SDL_ShowCursor();  // (full screen hides it: runtime/ui.c)
+    else if (w && (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN)) SDL_HideCursor();
+    Ev e = {};
+    e.kind = Ev::CLEAR;  // (keys and buttons held as it opens or closes: released)
+    queue(e);
+    LOG("[overlay] forge %s, settings %s%s\n", open ? "open" : "closed", g_settings_open ? "open" : "closed",
+        g_modal_open ? ", thank-you open" : "");
+}
+
+static std::atomic<int> g_last_input{USED_KEYS};  // (a PC's: the keys until something else is used)
+void overlay_input_seen(int kind) { g_last_input.store(kind, std::memory_order_relaxed); }
+int overlay_last_input(void) { return g_last_input.load(std::memory_order_relaxed); }
+
+static std::atomic<int> g_face_positions[4] = {1, 0, 3, 2};
+void overlay_face_positions(const int positions[4]) {
+    for (int i = 0; i < 4; ++i) g_face_positions[i] = positions[i];
+}
+int overlay_face_position(int semantic) { return g_face_positions[semantic & 3]; }
+void overlay_request_close(void) {
+    settings_panel_request_close();
+    g_settings_open = true;
+    set_open(g_forge_open);
+}
+bool overlay_settings_dirty(void) { return settings_panel_dirty(); }
+#ifndef __ANDROID__
+static std::atomic<bool> g_menu_opened;  // (the player opened the settings menu: menu_hint has nothing to say)
+#endif
+void overlay_toggle_settings(void) {
+    if (!g_enabled || g_modal_open) return;  // (the thank-you first: closed, F1 and the chord work again)
+    if (g_settings_open) { settings_panel_request_back(); return; }
+#ifndef __ANDROID__
+    g_menu_opened = true;
+#endif
+    g_settings_open = true;
+    set_open(g_forge_open);
+}
+
+// A finger as the menus' mouse: SDL's own mouse events made from a touch, or runtime/touch.cpp's (to_menu), which it
+// makes by hand and gives no time
+static bool finger_mouse(SDL_MouseID which, Uint64 timestamp) { return which == SDL_TOUCH_MOUSEID || !timestamp; }
+bool overlay_event(const SDL_Event *e) {
+    if (!g_enabled) return false;
+    if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && settings_panel_key((int)e->key.scancode)) return true;
+    if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN && !finger_mouse(e->button.which, e->button.timestamp) &&
+        settings_panel_mouse(e->button.button))  // (a mouse's button chosen for a keybind: not a finger's tap)
+        return true;
+    if (e->type == SDL_EVENT_MOUSE_WHEEL &&
+        settings_panel_wheel(e->wheel.integer_y * (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1 : 1)))
+        return true;
+    if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && e->key.scancode == SDL_SCANCODE_F1) {
+        overlay_toggle_settings();
+        return true;
+    }
+    if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && (int)e->key.scancode == g_menu_key) {
+        if (!g_modal_open) {
+            g_forge_touch = false;
+            set_open(!g_forge_open);
+        }
+        return true;
+    }
+    // (the phone's Back closes Forge's menu - unless the settings menu is over it, whose Back it is - as its x does)
+    if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && e->key.scancode == SDL_SCANCODE_AC_BACK && g_forge_open &&
+        !g_settings_open && !g_modal_open) {
+        set_open(false);
+        return true;
+    }
+    if (!g_open) return false;
+    SDL_Window *w = ui_window();
+    float density = w ? SDL_GetWindowPixelDensity(w) : 1.0f;  // (ImGui works in the image's pixels)
+    Ev v = {};
+    switch (e->type) {
+    case SDL_EVENT_MOUSE_MOTION:
+        v.kind = Ev::POS, v.x = e->motion.x * density, v.y = e->motion.y * density;
+        v.touch = finger_mouse(e->motion.which, e->motion.timestamp);
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP: {
+        static const int map[] = {-1, ImGuiMouseButton_Left, ImGuiMouseButton_Middle, ImGuiMouseButton_Right, 3, 4};
+        if (e->button.button >= 6 || map[e->button.button] < 0) return true;
+        v.kind = Ev::BUTTON, v.button = map[e->button.button], v.down = e->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+        v.x = e->button.x * density, v.y = e->button.y * density;
+        v.touch = finger_mouse(e->button.which, e->button.timestamp);
+        break;
+    }
+    case SDL_EVENT_MOUSE_WHEEL:
+        v.kind = Ev::WHEEL, v.x = -e->wheel.x, v.y = e->wheel.y;
+        break;
+    case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP: {
+        v.kind = Ev::KEY, v.down = e->type == SDL_EVENT_KEY_DOWN, v.mods = e->key.mod;
+        v.key = key_of(e->key.scancode, e->key.key);
+        queue(v);
+        // the port's own keys still work (screenshots, Alt+Enter full screen)
+        bool port_key = (e->key.scancode >= SDL_SCANCODE_F1 && e->key.scancode <= SDL_SCANCODE_F12) ||
+                        ((e->key.scancode == SDL_SCANCODE_RETURN || e->key.scancode == SDL_SCANCODE_KP_ENTER) &&
+                         (e->key.mod & SDL_KMOD_ALT));
+        return !port_key;
+    }
+    case SDL_EVENT_TEXT_INPUT:
+        v.kind = Ev::TEXT;
+        SDL_strlcpy(v.text, e->text.text, sizeof v.text);
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST: case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        v.kind = Ev::FOCUS, v.down = e->type == SDL_EVENT_WINDOW_FOCUS_GAINED;
+        queue(v);
+        return false;  // (the game's input sees it too)
+    default:
+        return false;
+    }
+    queue(v);
+    return true;
+}
+
+void overlay_pad(const OverlayPad *p) {
+    std::lock_guard<std::mutex> l(g_in_lock);
+    g_pad = *p;
+}
+
+bool overlay_enabled(void) { return g_enabled; }
+bool overlay_menu_open(void) { return g_open; }
+void overlay_open_forge(void) { g_forge_pending = true; }
+bool overlay_forge_typing(void) { return g_forge_typing.load(std::memory_order_relaxed); }
+
+static void apply_input(ImGuiIO &io) {
+    std::vector<Ev> evs;
+    OverlayPad pad;
+    {
+        std::lock_guard<std::mutex> l(g_in_lock);
+        evs.swap(g_in);
+        pad = g_pad;
+    }
+    for (const Ev &e : evs) {
+        switch (e.kind) {
+        case Ev::POS:
+            io.AddMouseSourceEvent(e.touch ? ImGuiMouseSource_TouchScreen : ImGuiMouseSource_Mouse);
+            io.AddMousePosEvent(e.x, e.y);
+            break;
+        case Ev::BUTTON:
+            io.AddMouseSourceEvent(e.touch ? ImGuiMouseSource_TouchScreen : ImGuiMouseSource_Mouse);
+            io.AddMousePosEvent(e.x, e.y);
+            io.AddMouseButtonEvent(e.button, e.down);
+            if (e.touch && !e.down) io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);  // (the finger is gone: nothing stays hovered)
+            break;
+        case Ev::WHEEL: io.AddMouseWheelEvent(e.x, e.y); break;
+        case Ev::KEY:
+            io.AddKeyEvent(ImGuiMod_Ctrl, (e.mods & SDL_KMOD_CTRL) != 0);
+            io.AddKeyEvent(ImGuiMod_Shift, (e.mods & SDL_KMOD_SHIFT) != 0);
+            io.AddKeyEvent(ImGuiMod_Alt, (e.mods & SDL_KMOD_ALT) != 0);
+            io.AddKeyEvent(ImGuiMod_Super, (e.mods & SDL_KMOD_GUI) != 0);
+            if (e.key != ImGuiKey_None) io.AddKeyEvent(e.key, e.down);
+            break;
+        case Ev::TEXT: io.AddInputCharactersUTF8(e.text); break;
+        case Ev::FOCUS: io.AddFocusEvent(e.down); break;
+        case Ev::CLEAR:
+            io.ClearInputKeys();
+            io.ClearInputMouse();
+            memset(&g_pad, 0, sizeof g_pad);
+            pad = {};
+            break;
+        }
+    }
+    // the controller (as Forge maps it: A activates, B cancels, the left stick and the d-pad move)
+    if (!g_open) pad = {};
+    // Apply only to settings. Forge retains its existing semantic A/B mapping.
+    if (g_settings_open) {
+        int a = overlay_face_position(0), b = overlay_face_position(1);
+        int confirm, cancel;
+        menu_confirm_buttons(config_live_menu_confirm(), a, b, pad.a, pad.b, &confirm, &cancel);
+        pad.a = confirm; pad.b = cancel;
+    }
+    static int last_policy = -1;
+    static bool wait_release, was_settings;
+    if (g_settings_open && !was_settings) wait_release = true;
+    was_settings = g_settings_open;
+    int policy = g_settings_open ? config_live_menu_confirm() : MENU_CONFIRM_ORIGINAL;
+    if (last_policy >= 0 && policy != last_policy) wait_release = true;
+    last_policy = policy;
+    if (wait_release) {
+        if (!pad.a && !pad.b) wait_release = false;
+        pad.a = pad.b = false;
+    }
+    io.AddKeyEvent(ImGuiKey_GamepadFaceDown, pad.a);
+    io.AddKeyEvent(ImGuiKey_GamepadFaceRight, pad.b);
+    io.AddKeyEvent(ImGuiKey_GamepadFaceUp, pad.x);
+    io.AddKeyEvent(ImGuiKey_GamepadFaceLeft, pad.y);
+    io.AddKeyEvent(ImGuiKey_GamepadDpadUp, pad.up);
+    io.AddKeyEvent(ImGuiKey_GamepadDpadDown, pad.down);
+    io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, pad.left);
+    io.AddKeyEvent(ImGuiKey_GamepadDpadRight, pad.right);
+    io.AddKeyEvent(ImGuiKey_GamepadL1, pad.l);
+    io.AddKeyEvent(ImGuiKey_GamepadR1, pad.r);
+    io.AddKeyEvent(ImGuiKey_GamepadStart, pad.plus);
+    io.AddKeyEvent(ImGuiKey_GamepadBack, pad.minus);
+    auto axis = [&](ImGuiKey k, float v) { io.AddKeyAnalogEvent(k, v > 0.2f, std::min(v, 1.0f)); };
+    axis(ImGuiKey_GamepadLStickLeft, -pad.lx);
+    axis(ImGuiKey_GamepadLStickRight, pad.lx);
+    axis(ImGuiKey_GamepadLStickUp, pad.ly);
+    axis(ImGuiKey_GamepadLStickDown, -pad.ly);
+}
+
+// ------------------------------------------------------------------ setup
+static void forge_style(ImGuiStyle &style) {  // Forge's own (source/forge/graphics.cpp, Graphics::setupStyle)
+    style.WindowPadding = {12.0f, 12.0f};
+    style.WindowRounding = 2.0f;
+    style.WindowBorderSize = 1.0f;
+    style.WindowMinSize = {20.0f, 20.0f};
+    style.WindowTitleAlign = {0.5f, 0.5f};
+    style.WindowMenuButtonPosition = ImGuiDir_None;
+    style.ChildRounding = 0.0f;
+    style.ChildBorderSize = 1.0f;
+    style.PopupRounding = 0.0f;
+    style.PopupBorderSize = 1.0f;
+    style.FramePadding = {6.0f, 6.0f};
+    style.FrameRounding = 1.0f;
+    style.FrameBorderSize = 0.0f;
+    style.ItemSpacing = {12.0f, 6.0f};
+    style.ItemInnerSpacing = {6.0f, 3.0f};
+    style.CellPadding = {12.0f, 6.0f};
+    style.IndentSpacing = 20.0f;
+    style.ColumnsMinSpacing = 6.0f;
+    style.ScrollbarSize = 12.0f;
+    style.ScrollbarRounding = 0.0f;
+    style.GrabMinSize = 12.0f;
+    style.GrabRounding = 1.0f;
+    style.TabRounding = 0.0f;
+    style.TabBorderSize = 0.0f;
+    style.TabCloseButtonMinWidthUnselected = 0.0f;
+    style.ColorButtonPosition = ImGuiDir_Right;
+    style.ButtonTextAlign = {0.5f, 0.5f};
+    style.SelectableTextAlign = {0.0f, 0.0f};
+    const ImVec4 bg = {0.078f, 0.086f, 0.102f, 1.0f}, dark = {0.047f, 0.055f, 0.071f, 1.0f},
+                 frame = {0.118f, 0.133f, 0.149f, 1.0f}, line = {0.157f, 0.169f, 0.192f, 1.0f},
+                 hover = {0.196f, 0.176f, 0.545f, 1.0f}, active = {0.235f, 0.216f, 0.596f, 1.0f},
+                 accent = {0.498f, 0.514f, 1.0f, 1.0f}, bar = {0.098f, 0.106f, 0.122f, 1.0f},
+                 dim = {0.196f, 0.176f, 0.545f, 0.502f}, sep = {0.157f, 0.184f, 0.251f, 1.0f};
+    ImVec4 *c = style.Colors;
+    c[ImGuiCol_Text] = {1.0f, 1.0f, 1.0f, 1.0f};
+    c[ImGuiCol_TextDisabled] = {0.275f, 0.318f, 0.451f, 1.0f};
+    c[ImGuiCol_WindowBg] = c[ImGuiCol_ChildBg] = c[ImGuiCol_PopupBg] = c[ImGuiCol_BorderShadow] = bg;
+    c[ImGuiCol_Border] = line;
+    c[ImGuiCol_FrameBg] = frame;
+    c[ImGuiCol_FrameBgHovered] = line;
+    c[ImGuiCol_FrameBgActive] = active;
+    c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = dark;
+    c[ImGuiCol_TitleBgCollapsed] = bg;
+    c[ImGuiCol_MenuBarBg] = bar;
+    c[ImGuiCol_ScrollbarBg] = dark;
+    c[ImGuiCol_ScrollbarGrab] = c[ImGuiCol_ScrollbarGrabActive] = frame;
+    c[ImGuiCol_ScrollbarGrabHovered] = line;
+    c[ImGuiCol_CheckMark] = c[ImGuiCol_SliderGrab] = accent;
+    c[ImGuiCol_SliderGrabActive] = {0.537f, 0.553f, 1.0f, 1.0f};
+    c[ImGuiCol_Button] = {0.257f, 0.267f, 0.554f, 1.0f};
+    c[ImGuiCol_ButtonHovered] = c[ImGuiCol_HeaderHovered] = c[ImGuiCol_ResizeGripHovered] = hover;
+    c[ImGuiCol_ButtonActive] = c[ImGuiCol_HeaderActive] = c[ImGuiCol_ResizeGripActive] = active;
+    c[ImGuiCol_Header] = c[ImGuiCol_ResizeGrip] = frame;
+    c[ImGuiCol_Separator] = c[ImGuiCol_SeparatorHovered] = c[ImGuiCol_SeparatorActive] = sep;
+    c[ImGuiCol_Tab] = c[ImGuiCol_TabDimmed] = dark;
+    c[ImGuiCol_TabHovered] = frame;
+    c[ImGuiCol_TabSelected] = bar;
+    c[ImGuiCol_TabDimmedSelected] = bg;
+    c[ImGuiCol_PlotLines] = {0.522f, 0.600f, 0.702f, 1.0f};
+    c[ImGuiCol_PlotLinesHovered] = {0.039f, 0.980f, 0.980f, 1.0f};
+    c[ImGuiCol_PlotHistogram] = {1.0f, 0.290f, 0.596f, 1.0f};
+    c[ImGuiCol_PlotHistogramHovered] = {0.996f, 0.475f, 0.698f, 1.0f};
+    c[ImGuiCol_TableHeaderBg] = c[ImGuiCol_TableBorderStrong] = dark;
+    c[ImGuiCol_TableBorderLight] = {0.0f, 0.0f, 0.0f, 1.0f};
+    c[ImGuiCol_TableRowBg] = frame;
+    c[ImGuiCol_TableRowBgAlt] = bar;
+    c[ImGuiCol_TextSelectedBg] = active;
+    c[ImGuiCol_DragDropTarget] = c[ImGuiCol_NavCursor] = c[ImGuiCol_NavWindowingHighlight] = accent;
+    c[ImGuiCol_NavWindowingDimBg] = c[ImGuiCol_ModalWindowDimBg] = dim;
+}
+
+void overlay_init(const char *font_path, float font_size, int menu_key) {
+#ifdef MHGU_NULL_BACKEND
+    return;
+#endif
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = "forge_imgui.ini";  // (window positions; in the game folder, beside mhgurecomp.ini)
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    io.BackendPlatformName = "mhgurecomp";
+    g_font_size = font_size > 0 ? font_size : 12.0f;
+    ImFontConfig cfg;
+    cfg.SizePixels = g_font_size;
+#ifdef __ANDROID__
+    static const char *const sys_fonts[] = {"/system/fonts/Roboto-Medium.ttf", "/system/fonts/RobotoStatic-Regular.ttf",
+                                            "/system/fonts/Roboto-Regular.ttf"};  // (the system's; Forge's is Roboto Medium)
+    for (const char *p : sys_fonts)
+        if (!font_path && access(p, R_OK) == 0) font_path = p;
+#endif
+    ImFont *font = font_path ? io.Fonts->AddFontFromFileTTF(font_path, g_font_size, &cfg) : nullptr;
+    if (!font) io.Fonts->AddFontDefaultVector(&cfg);
+#ifdef __ANDROID__
+    // (the titles' serif, as the game's own and the MH4U port's: the second font, settings_panel.cpp title_font; a phone
+    // without one has the main font there)
+    const char *serif = nullptr;
+    for (const char *p : {"/system/fonts/NotoSerif-Bold.ttf", "/system/fonts/NotoSerif-Regular.ttf"})
+        if (!serif && access(p, R_OK) == 0) serif = p;
+    if (serif && io.Fonts->AddFontFromFileTTF(serif, g_font_size, &cfg))
+        LOG("[forge] titles in %s\n", serif);
+#endif
+#ifdef _WIN32
+    // (ImGui's own font has Latin-1 only: what it lacks - the thank-you's em dash, a licence's quotes, a chat line in another
+    // script - comes from Windows' Segoe UI, merged after it; the font itself stays as it was)
+    if (!font) {
+        const char *windir = getenv("WINDIR");
+        std::string fallback = std::string(windir && *windir ? windir : "C:/Windows") + "/Fonts/segoeui.ttf";
+        ImFontConfig merge;
+        merge.MergeMode = true;
+        merge.SizePixels = g_font_size;
+        merge.Flags |= ImFontFlags_NoLoadError;
+        if (access(fallback.c_str(), R_OK) == 0) io.Fonts->AddFontFromFileTTF(fallback.c_str(), g_font_size, &merge);
+    }
+#endif
+    ImGui::StyleColorsDark();
+    forge_style(ImGui::GetStyle());
+    ImGui::GetStyle().FontSizeBase = g_font_size;
+    g_base_style = ImGui::GetStyle();
+    g_menu_key = menu_key;
+#ifdef __ANDROID__
+    {
+        const char *e = getenv("MHGU_PERF_MENU_PRESENT");  // (read once: the menu hold's presents, menu_holds_game)
+        g_perf_menu_present = !(e && atoi(e) == 0), g_perf_menu_log = true;
+        if (e) LOG("[perf] MHGU_PERF_MENU_PRESENT=%d\n", (int)g_perf_menu_present);
+    }
+#endif
+    {
+        const char *e = getenv("MHGU_PERF_OVERLAY_REUSE");  // (read once: frame_once)
+        g_perf_overlay_reuse = e ? std::clamp(atoi(e), 0, 2) : 1;  // (unset: on)
+        if (g_perf_overlay_reuse) touch_reuse_begin();
+        if (e) LOG("[perf] MHGU_PERF_OVERLAY_REUSE=%d\n", g_perf_overlay_reuse);
+    }
+    g_enabled = true;
+    LOG("[forge] ImGui %s overlay: %s opens the menu (font %s, %.0f px)\n", IMGUI_VERSION,
+        SDL_GetScancodeName((SDL_Scancode)menu_key), font ? font_path : "ImGui's", g_font_size);
+}
+
+// ------------------------------------------------------------------ notices (any thread -> game thread)
+// A few seconds at the top of the screen, menus open or not (runtime/net/ldn.c: the hub server's failures). Drawn on
+// the foreground draw list: over every window, taking no input or focus.
+static std::mutex g_notice_lock;
+static std::string g_notice_title, g_notice_text;
+static uint64_t g_notice_ns;  // when it came (SDL_GetTicksNS); 0: none
+static const uint64_t NOTICE_NS = 7000000000ull;
+
+void overlay_notice(const char *title, const char *text) {
+    std::lock_guard<std::mutex> l(g_notice_lock);
+    g_notice_title = title ? title : "";
+    g_notice_text = text ? text : "";
+    g_notice_ns = std::max<uint64_t>(SDL_GetTicksNS(), 1);
+}
+
+// (the thank-you open: a notice waits under it, its seconds not counting - shown whole once it is closed)
+static void notice_hold(uint64_t now) {
+    std::lock_guard<std::mutex> l(g_notice_lock);
+    if (g_notice_ns) g_notice_ns = std::max<uint64_t>(now, 1);
+}
+
+// (now is read once a frame: a notice posted since, menu_hint's or another thread's, came after it and is still up)
+static bool notice_due(uint64_t now) {
+    std::lock_guard<std::mutex> l(g_notice_lock);
+    if (g_notice_ns && now >= g_notice_ns + NOTICE_NS) g_notice_ns = 0;
+    return g_notice_ns != 0;
+}
+
+#ifndef __ANDROID__
+// (a desktop) Nothing on the screen says what opens the settings menu: a few seconds into each start a notice says so,
+// until the player has opened it once ([Application] MenuHintSeen, which settings_panel.cpp turns On as it opens). A
+// notice already up (a controller to set up, say) goes first; the menu opened before then, none this time.
+static const uint64_t MENU_HINT_NS = 6000000000ull;  // (after the first frame the overlay drew)
+static void menu_hint(uint64_t now) {
+    static uint64_t first;
+    static bool done;
+    if (done) return;
+    if (g_config.menu_hint_seen || g_menu_opened) {
+        done = true;
+        return;
+    }
+    if (!first) first = now;
+    // (nor over the credits or the thank-you after them: once they are done)
+    if (now - first < MENU_HINT_NS || notice_due(now) || settings_panel_credits_up()) return;
+    done = true;
+    int lang = config_language();
+    overlay_notice(settings_text(lang, "F1: settings"), settings_text(lang, "L3 and R3 together on a controller"));
+    LOG("[overlay] notice: F1 opens the settings menu (MenuHintSeen = Off)\n");
+}
+#endif
+
+// A copy of the game's files cut short (romfs.c romfs_incomplete: short of the game's size but its movies, or empty files)
+// starts, then closes or draws black somewhere later (#106): a few seconds into each start, once nothing else is shown,
+// the player is told. Short by size, empty comes as 0 and the size is told; else the empty files.
+static const uint64_t ROMFS_NOTICE_NS = 8000000000ull;  // (after the first frame the overlay drew)
+static void romfs_notice(uint64_t now) {
+    static uint64_t first;
+    static bool done;
+    if (done) return;
+    double gb = 0;
+    int empty = 0;
+    if (!romfs_incomplete(&gb, &empty)) {
+        done = true;
+        return;
+    }
+    if (!first) first = now;
+    if (now - first < ROMFS_NOTICE_NS || notice_due(now) || settings_panel_credits_up()) return;
+    done = true;
+    int lang = config_language();
+    char size[16], text[400];
+    snprintf(size, sizeof size, "%.1f", gb);
+    if (lang == 1)
+        for (char *c = size; *c; c++)
+            if (*c == '.') *c = ',';  // (Spanish: 11,5)
+    if (!empty)
+        snprintf(text, sizeof text,
+                 settings_text(lang, "The romfs folder holds %s GB of the game's 12.3 GB: some files were cut short when they were "
+                                     "copied. If the game closes or shows black, copy the romfs folder to the device again."),
+                 size);
+    else
+        snprintf(text, sizeof text,
+                 settings_text(lang, "%d of the romfs folder's files are empty: they were cut short when they were copied. If the "
+                                     "game closes or shows black, copy the romfs folder to the device again."),
+                 empty);
+    overlay_notice(settings_text(lang, "Game files incomplete"), text);
+    LOG("[overlay] notice: the game's files look incomplete (%s GB, %d empty)\n", size, empty);
+}
+
+static void draw_plate(const std::string &title, const std::string &text, float alpha, float scale);
+static void draw_notice(uint64_t now, float scale) {
+    std::string title, text;
+    uint64_t at;
+    {
+        std::lock_guard<std::mutex> l(g_notice_lock);
+        if (!g_notice_ns) return;
+        title = g_notice_title, text = g_notice_text, at = g_notice_ns;
+    }
+    float age = now > at ? (now - at) / 1e9f : 0.f;  // (posted since now was read: just up)
+    draw_plate(title, text, std::clamp(std::min(age / .15f, (NOTICE_NS / 1e9f - age) / .5f), 0.f, 1.f), scale);
+}
+
+// The start's shader builds (exec.c vk_shader_progress; 1.0's S30), on the notice's plate while no notice is up: once
+// they have taken SHADER_PLATE_NS (a warm cache is done within a second or two and shows nothing) and while they last
+// - a first start, an update that changed the translator, a cleared cache, a phone whose driver cache was lost - so the
+// player knows why models come late and the first areas stutter; "Shaders built" for a moment once they are done.
+// Updated at most 4 times a second (the counts move every frame)
+extern "C" bool vk_shader_progress(int *done, int *total);
+static const uint64_t SHADER_PLATE_NS = 3000000000ull, SHADER_DONE_NS = 2500000000ull;
+static bool shader_plate(uint64_t now, std::string &title, std::string &text, float &alpha) {
+    static uint64_t first, shown, done_at, read_at;
+    static bool busy, finished;
+    static int done, total;
+    if (finished) return false;
+    if (now - read_at >= 250000000ull) busy = vk_shader_progress(&done, &total), read_at = now;
+    if (!first) first = now;
+    int lang = config_language();
+    if (busy) {
+        if (now - first < SHADER_PLATE_NS || total <= 0) return false;
+        if (!shown) {
+            shown = now;
+            LOG("[overlay] the shader plate: %d of %d built %.1f s after the overlay's first frame\n", done, total,
+                (now - first) / 1e9);
+        }
+        char line[160];
+        snprintf(line, sizeof line, lang == 1 ? "%d de %d (%d %%): los modelos y efectos pueden aparecer tarde hasta que terminen"
+                                              : "%d of %d (%d%%): models and effects may show late until they are done",
+                 done, total, total ? done * 100 / total : 0);
+        title = lang == 1 ? "Armando shaders" : "Building shaders", text = line;
+        alpha = std::clamp((now - shown) / 3e8f, 0.f, 1.f);
+        return true;
+    }
+    if (!shown) {  // (done before the plate was due: nothing to say)
+        if (now - first >= SHADER_PLATE_NS) finished = true;
+        return false;
+    }
+    if (!done_at) done_at = now, LOG("[overlay] the shader plate: done, %.1f s after it showed\n", (now - shown) / 1e9);
+    if (now - done_at >= SHADER_DONE_NS) {
+        finished = true;
+        return false;
+    }
+    title = lang == 1 ? "Shaders armados" : "Shaders built";
+    text = lang == 1 ? "Todo listo." : "All done.";
+    alpha = std::clamp((SHADER_DONE_NS - (now - done_at)) / 5e8f, 0.f, 1.f);
+    return true;
+}
+
+// A notice's plate (draw_notice, shader_plate): a title over a text, at the top in the middle, under the FPS plate
+static void draw_plate(const std::string &title, const std::string &text, float alpha, float scale) {
+    auto color = [alpha](float r, float g, float b, float a) {
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, a * alpha));
+    };
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImFont *font = ImGui::GetFont();
+    float size = ImGui::GetFontSize() * 1.25f, pad = 10 * scale, bar = 4 * scale, gap = 3 * scale;
+    float wrap = std::min(vp->WorkSize.x * .6f, 620 * scale);
+    ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, wrap, title.c_str());
+    ImVec2 xs = font->CalcTextSizeA(size, FLT_MAX, wrap, text.c_str());
+    float w = std::max(ts.x, xs.x) + bar + 2 * pad, h = ts.y + gap + xs.y + 2 * pad;
+    float top = vp->WorkPos.y + 20 * scale, stats = perfstats_bottom();  // (under the FPS plate, both at the top)
+    if (stats > 0) top = std::max(top, stats + 8 * scale);
+    ImVec2 p0(vp->WorkPos.x + (vp->WorkSize.x - w) * .5f, top), p1(p0.x + w, p0.y + h);
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    // In the settings menu's colours, as the chat line's (draw_chat): Hunter the game's window with a red and green rule
+    // along its top and bottom, Blue and Gold a panel with a bar at its left
+    int theme = settings_panel_theme();
+    if (theme == THEME_HUNTER) {
+        float line = 2 * scale;
+        dl->AddRectFilled(p0, p1, color(50 / 255.f, 25 / 255.f, 24 / 255.f, .93f));
+        dl->AddRect(p0, p1, color(0, 0, 0, 1), 0, 0, 2 * scale);
+        dl->AddRectFilled(p0, ImVec2(p1.x, p0.y + line), color(176 / 255.f, 34 / 255.f, 30 / 255.f, 1));
+        dl->AddRectFilled(ImVec2(p0.x, p0.y + line), ImVec2(p1.x, p0.y + line * 1.7f), color(80 / 255.f, 142 / 255.f, 54 / 255.f, 1));
+        dl->AddRectFilled(ImVec2(p0.x, p1.y - line * 1.7f), ImVec2(p1.x, p1.y - line), color(80 / 255.f, 142 / 255.f, 54 / 255.f, 1));
+        dl->AddRectFilled(ImVec2(p0.x, p1.y - line), p1, color(176 / 255.f, 34 / 255.f, 30 / 255.f, 1));
+    } else if (theme == THEME_GOLD) {
+        dl->AddRectFilled(p0, p1, color(34 / 255.f, 25 / 255.f, 19 / 255.f, .94f), 6 * scale);
+        dl->AddRectFilled(p0, ImVec2(p0.x + bar, p1.y), color(213 / 255.f, 162 / 255.f, 79 / 255.f, 1), 6 * scale,
+                          ImDrawFlags_RoundCornersLeft);
+    } else {
+        dl->AddRectFilled(p0, p1, color(.025f, .04f, .065f, .92f), 6 * scale);
+        dl->AddRectFilled(p0, ImVec2(p0.x + bar, p1.y), color(1, .72f, .3f, 1), 6 * scale, ImDrawFlags_RoundCornersLeft);
+    }
+    ImVec2 at_text(p0.x + bar + pad, p0.y + pad);
+    dl->AddText(font, size, at_text, color(1, .8f, .45f, 1), title.c_str(), nullptr, wrap);
+    ImVec4 ink = theme == THEME_BLUE ? ImVec4(.96f, .97f, 1, 1) : ImVec4(242 / 255.f, 216 / 255.f, 170 / 255.f, 1);
+    dl->AddText(font, size, ImVec2(at_text.x, at_text.y + ts.y + gap), color(ink.x, ink.y, ink.z, 1), text.c_str(), nullptr, wrap);
+}
+
+// The line of chat being typed ("/", runtime/hle/chat.c): where the player dragged it (at first above the game's
+// chat window), wrapped
+static void draw_chat(const char *line, uint64_t now, float scale) {
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImFont *font = ImGui::GetFont();
+    float size = ImGui::GetFontSize() * 1.25f, pad = 8 * scale, bar = 4 * scale;
+    std::string text = std::string("Chat: ") + line + ((now / 500000000ull) & 1 ? "_" : " ");
+    float wrap = std::min(vp->WorkSize.x * .45f, 560 * scale);  // (a long line wraps; the box grows upwards)
+    ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, wrap, text.c_str());
+    float w = std::max(ts.x, 320 * scale) + bar + 2 * pad, h = ts.y + 2 * pad;
+    float left, low;
+    chat_position(&left, &low);
+    float bottom = vp->WorkPos.y + vp->WorkSize.y * low;
+    ImVec2 p0(vp->WorkPos.x + vp->WorkSize.x * left, bottom - h), p1(p0.x + w, bottom);
+    chat_set_box((p0.x - vp->WorkPos.x) / vp->WorkSize.x, (p0.y - vp->WorkPos.y) / vp->WorkSize.y,
+                 (p1.x - vp->WorkPos.x) / vp->WorkSize.x, (p1.y - vp->WorkPos.y) / vp->WorkSize.y);
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    // In the settings menu's colours ([Application] Theme, runtime/settings_panel.cpp theme()): Blue and Gold a panel
+    // with a bar at its left, Hunter the game's window with a red and green rule along its top and bottom
+    int theme = settings_panel_theme();
+    if (theme == THEME_HUNTER) {
+        float line = 2 * scale;
+        dl->AddRectFilled(p0, p1, IM_COL32(50, 25, 24, 236));
+        dl->AddRect(p0, p1, IM_COL32(0, 0, 0, 255), 0, 0, 2 * scale);
+        dl->AddRectFilled(p0, ImVec2(p1.x, p0.y + line), IM_COL32(176, 34, 30, 255));
+        dl->AddRectFilled(ImVec2(p0.x, p0.y + line), ImVec2(p1.x, p0.y + line * 1.7f), IM_COL32(80, 142, 54, 255));
+        dl->AddRectFilled(ImVec2(p0.x, p1.y - line * 1.7f), ImVec2(p1.x, p1.y - line), IM_COL32(80, 142, 54, 255));
+        dl->AddRectFilled(ImVec2(p0.x, p1.y - line), p1, IM_COL32(176, 34, 30, 255));
+    } else {
+        bool gold = theme == THEME_GOLD;
+        dl->AddRectFilled(p0, p1, gold ? IM_COL32(34, 25, 19, 240) : IM_COL32(6, 10, 17, 235), 6 * scale);
+        dl->AddRectFilled(p0, ImVec2(p0.x + bar, p1.y), gold ? IM_COL32(213, 162, 79, 255) : IM_COL32(111, 216, 255, 255),
+                          6 * scale, ImDrawFlags_RoundCornersLeft);
+    }
+    ImU32 ink = theme == THEME_GOLD ? IM_COL32(242, 216, 170, 255) : IM_COL32(244, 247, 252, 255);
+    dl->AddText(font, size, ImVec2(p0.x + bar + pad, p0.y + pad), ink, text.c_str(), nullptr, wrap);
+}
+
+// ------------------------------------------------------------------ frames (game thread)
+static std::mutex g_snap_lock;  // the copy the render thread draws
+static ImDrawData g_snap;
+static uint32_t g_snap_gen;  // (counts the copies: overlay_draw's turned one is made again for a new one)
+static std::atomic<uint32_t> g_disp_w, g_disp_h;
+static bool g_plugins_init;
+static uint64_t g_last_ns;
+
+static void snap_clear(void) {
+    for (ImDrawList *l : g_snap.CmdLists) IM_DELETE(l);
+    g_snap.CmdLists.resize(0);
+    g_snap.CmdListsCount = g_snap.TotalIdxCount = g_snap.TotalVtxCount = 0;
+    g_snap.Valid = false;
+}
+
+static void frame_once(void *cpu);
+// (MHGU_PERF_MENU_PRESENT=1, the settings menu holding the game) the frames built since the start whose draw lists
+// differ from the one before (or that uploaded a texture): the hold presents the last picture again only when this
+// moved, so an unchanged menu is not drawn into the window again with the very same pixels
+static uint64_t g_snap_seq;
+static bool g_snap_compare;  // (set by the hold: frame_once compares each new frame with the one before)
+// Every ImDrawList the render thread would draw, byte for byte (the commands, their textures and clip rectangles, the
+// indices and the vertices) and the display's place and size: the same picture
+static bool snap_same(const ImDrawData *dd) {
+    if (!g_snap.Valid || g_snap.CmdListsCount != dd->CmdListsCount || g_snap.TotalVtxCount != dd->TotalVtxCount ||
+        g_snap.TotalIdxCount != dd->TotalIdxCount || g_snap.CmdLists.Size != dd->CmdLists.Size)
+        return false;
+    if (memcmp(&g_snap.DisplayPos, &dd->DisplayPos, sizeof dd->DisplayPos) ||
+        memcmp(&g_snap.DisplaySize, &dd->DisplaySize, sizeof dd->DisplaySize) ||
+        memcmp(&g_snap.FramebufferScale, &dd->FramebufferScale, sizeof dd->FramebufferScale))
+        return false;
+    for (int i = 0; i < dd->CmdLists.Size; i++) {
+        const ImDrawList *a = dd->CmdLists[i], *b = g_snap.CmdLists[i];
+        if (a->CmdBuffer.Size != b->CmdBuffer.Size || a->IdxBuffer.Size != b->IdxBuffer.Size ||
+            a->VtxBuffer.Size != b->VtxBuffer.Size || a->Flags != b->Flags)
+            return false;
+        for (const ImDrawCmd &c : a->CmdBuffer)
+            if (c.UserCallback) return false;  // (a callback's data is not copied with the list: never taken as the same)
+        if (memcmp(a->CmdBuffer.Data, b->CmdBuffer.Data, (size_t)a->CmdBuffer.Size * sizeof(ImDrawCmd)) ||
+            memcmp(a->IdxBuffer.Data, b->IdxBuffer.Data, (size_t)a->IdxBuffer.Size * sizeof(ImDrawIdx)) ||
+            memcmp(a->VtxBuffer.Data, b->VtxBuffer.Data, (size_t)a->VtxBuffer.Size * sizeof(ImDrawVert)))
+            return false;
+    }
+    return true;
+}
+#ifdef __ANDROID__
+extern "C" bool ldn_net_up(void);
+extern "C" void vi_menu_hold(bool on);
+extern "C" bool vk_present_again(void);
+extern "C" bool vk_present_needed(void);
+extern "C" uint64_t vk_last_present_ns(void);
+// The settings menu, or the touch controls' layout editor opened from it, is open and the player plays alone
+// ([Application] PauseInMenu; never with others: a Local Play or hub network up)
+static bool menu_holds_game(void) {
+    return g_ready && ((g_settings_open && !g_modal_open) || touch_editor_open()) && config_live_pause_menu() && !ldn_net_up();
+}
+#endif
+
+void overlay_frame(void *cpu) {
+    // (once a frame on the game's update thread: with [Application] PauseInBackground the game stops here while the app
+    // is in the background, its clock held: runtime/hle/vi.c)
+    vi_pause_game();
+    frame_once(cpu);
+#ifdef __ANDROID__
+    // (the settings menu open, playing alone: the game waits here, as on the console's HOME menu - gu-native #94. The menu
+    // goes on being drawn, over the last picture presented again once the game's own presents have stopped)
+    if (menu_holds_game()) {
+        vi_menu_hold(true);
+        touch_game_held(true);
+        uint64_t next = plat_now_ns();
+        uint64_t shown_seq = ~0ull, shown_ns = 0, skipped = 0, presented = 0;  // (MHGU_PERF_MENU_PRESENT)
+        g_snap_compare = g_perf_menu_present;
+        while (menu_holds_game()) {
+            if (touch_editor_step()) break;  // (a part of the HUD dragged in the editor: a step of the game draws it there)
+            next += 16666667;
+            uint64_t now = plat_now_ns();
+            if (next < now) next = now;
+            plat_sleep_until_ns(next);
+            vi_pause_game();  // (the app went to the background meanwhile)
+            frame_once(cpu);
+            now = plat_now_ns();
+            if (now - vk_last_present_ns() > 50000000ull) {
+                if (!g_perf_menu_present || g_snap_seq != shown_seq || now - shown_ns >= 1000000000ull || vk_present_needed()) {
+                    if (vk_present_again()) shown_seq = g_snap_seq, shown_ns = now;
+                    presented++;
+                } else {
+                    skipped++;
+                }
+            }
+        }
+        g_snap_compare = false;
+        if (g_perf_menu_log)
+            LOG("[perf] menu hold: %llu presents, %llu unchanged frames not presented again\n", (unsigned long long)presented,
+                (unsigned long long)skipped);
+        touch_game_held(false);
+        vi_menu_hold(false);
+    }
+#endif
+}
+
+static void frame_once(void *cpu) {
+    if (!g_ready) return;
+    // (the menu closed: its state let go here, drawn - the credits - only inside the frame below: before the first frame
+    // there is no font, the credits' text measured with none faulted at the first frame - "accessing 0" under
+    // frame_update - and later ones were drawn into the last frame's list, cleared as the frame began)
+    if (!g_settings_open) settings_panel_idle();
+    bool credits = settings_panel_credits_up();
+    bool open = g_open, free_render = forge_plugins_have(FORGE_IMGUI_FREE_RENDER);
+    uint64_t now = SDL_GetTicksNS();
+#ifndef __ANDROID__
+    menu_hint(now);
+#endif
+    romfs_notice(now);
+    if (g_modal_open) notice_hold(now);
+    bool notice = notice_due(now);
+    std::string plate_title, plate_text;
+    float plate_alpha = 0;
+    bool plate = !notice && shader_plate(now, plate_title, plate_text, plate_alpha);
+    char line[256];
+    bool chat = chat_composing(line, sizeof line);
+    chat_port_init();  // (the port's chat: its button and lines over the game, runtime/chat_port.cpp)
+    bool chat_over = chat_port_frame();
+    ImGuiIO &io = ImGui::GetIO();
+    bool touch = touch_drawn();  // (hidden, the settings button still shows)
+    bool stats = perfstats_visible();  // ([Performance] ShowStats: runtime/perfstats.cpp)
+    bool fading = settings_panel_fading();  // (the settings menu closed a moment ago: fading out, taking no input)
+    if (!open && !free_render && !notice && !plate && !chat && !chat_over && !touch && !stats && !credits && !fading) {  // (nothing to draw)
+        std::lock_guard<std::mutex> l(g_snap_lock);
+        if (g_snap.Valid) snap_clear(), g_snap_seq++;
+        apply_input(io);  // (keep the queue short)
+        g_last_ns = 0;
+        return;
+    }
+    uint32_t w = g_disp_w, h = g_disp_h;
+    if (!w || !h) return;
+    // MHGU_PERF_OVERLAY_REUSE=1: a frame with the touch controls alone (no menu, notice, chat, stats, credits or plugin's
+    // drawing) whose controls would draw the very same lists as the frame built last (touch_draw_unchanged: nothing of
+    // theirs moving, nothing they show changed) is not built again: the render thread draws the copy it has (g_snap), as
+    // it does every frame. Once a second it is built anyway. =2, a check: such frames are built, compared with the copy
+    // (snap_same) and a difference logged
+    bool alone = touch && !open && !free_render && !notice && !plate && !chat && !chat_over && !stats && !credits && !fading && !g_modal_open &&
+                 !g_settings_open && !g_forge_open && !settings_panel_confirming();
+    bool same = g_perf_overlay_reuse && alone && g_reuse_last && g_snap.Valid && w == g_reuse_w && h == g_reuse_h &&
+                now - g_reuse_built_ns < 1000000000ull && touch_draw_unchanged((float)w, (float)h);
+    if (g_perf_overlay_reuse && now - g_reuse_log_ns >= 60000000000ull) {
+        if (g_reuse_log_ns)
+            LOG("[perf] overlay: %llu frames built, %llu %s (a minute)\n", (unsigned long long)g_reuse_n[0],
+                (unsigned long long)g_reuse_n[1], g_perf_overlay_reuse == 1 ? "drawn again unbuilt" : "checked");
+        g_reuse_n[0] = g_reuse_n[1] = 0, g_reuse_log_ns = now;
+    }
+    g_reuse_n[same]++;
+    if (same && g_perf_overlay_reuse == 1) {
+        apply_input(io);  // (keep the queue short: nothing reaches it with no menu open)
+        g_last_ns = now;
+        return;
+    }
+    io.DisplaySize = ImVec2((float)w, (float)h);
+    io.DisplayFramebufferScale = ImVec2(1, 1);
+    float scale = std::max(1.0f, h / 720.0f);  // (Forge's sizes are for the console's 720p screen)
+    if (scale != g_scale) {
+        ImGuiStyle &style = ImGui::GetStyle();
+        style = g_base_style;
+        style.ScaleAllSizes(scale);
+        style.FontScaleDpi = scale;
+        g_scale = scale;
+    }
+    io.DeltaTime = g_last_ns ? std::clamp((now - g_last_ns) / 1e9f, 1e-4f, 0.1f) : 1.0f / 30;
+    g_last_ns = now;
+    apply_input(io);
+
+    if (!g_plugins_init) {  // (Forge: right after its context is made)
+        g_plugins_init = true;
+        forge_imgui_init(cpu);
+    }
+    ImGui_ImplVulkan_NewFrame();
+    settings_panel_before_frame(g_settings_open);
+    ImGui::NewFrame();
+    bool settings = g_settings_open;
+    settings_panel(&settings);
+    if (settings_panel_confirming()) settings = true;
+    if (settings != g_settings_open) { g_settings_open = settings; set_open(g_forge_open); }
+    // The thank-you opened or closed this frame: while it is open every input is the overlay's (overlay_event, the
+    // controller in runtime/host_input.c, the fingers in runtime/touch.cpp), as with a menu
+    bool modal = settings_panel_modal();
+    if (modal != g_modal_open) { g_modal_open = modal; set_open(g_forge_open); }
+    if (!g_settings_open && !g_modal_open && g_forge_pending.exchange(false)) {  // (its row in the Mods tab: now closed)
+        g_forge_touch = overlay_last_input() == USED_TOUCH;
+        set_open(true);
+    }
+    // Opened by touch (its row tapped), Forge's menu is drawn bigger: its letters and the room around its controls
+    // FORGE_TOUCH times (a phone's 720 lines are a few centimetres, sized for the console's handheld screen they leave a
+    // control a millimetre or two across), a control takes a finger a little outside itself (TouchExtraPadding), and a
+    // drag of a finger scrolls it, as a phone's lists do (moving it is left to its title bar). The plugins' own drawing
+    // over the game (damage numbers...) keeps its size.
+    const bool touch_ui = g_forge_open && g_forge_touch;
+    constexpr float FORGE_TOUCH = 2.0f;
+    io.ConfigWindowsMoveFromTitleBarOnly = touch_ui;
+    ImGui::GetStyle().TouchExtraPadding = touch_ui ? ImVec2(4 * scale, 4 * scale) : ImVec2(0, 0);
+    if (touch_ui) {
+        const ImGuiStyle &st = ImGui::GetStyle();
+        ImGui::PushFont(nullptr, st.FontSizeBase * FORGE_TOUCH);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(st.FramePadding.x * FORGE_TOUCH, st.FramePadding.y * FORGE_TOUCH));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(st.ItemSpacing.x * FORGE_TOUCH, st.ItemSpacing.y * FORGE_TOUCH));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing,
+                            ImVec2(st.ItemInnerSpacing.x * FORGE_TOUCH, st.ItemInnerSpacing.y * FORGE_TOUCH));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(st.WindowPadding.x * FORGE_TOUCH, st.WindowPadding.y * FORGE_TOUCH));
+        ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, st.GrabMinSize * FORGE_TOUCH * 1.5f);
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, st.ScrollbarSize * FORGE_TOUCH * 1.5f);
+        ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, st.IndentSpacing * FORGE_TOUCH);
+        // (placed each time it opens: a size kept from a mouse's use would be small for the bigger letters)
+        ImGui::SetNextWindowPos(ImVec2(w * 0.5f, h * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(w * 0.6f, h * 0.85f), ImGuiCond_Appearing);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2((float)w, (float)h));
+    }
+    if (g_forge_open) {
+        bool keep = true;
+        if (!touch_ui) {
+            ImGui::SetNextWindowPos(ImVec2(40 * scale, 40 * scale), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(420 * scale, 360 * scale), ImGuiCond_FirstUseEver);
+        }
+        if (ImGui::Begin("forge", &keep)) {
+            if (ImGui::CollapsingHeader("About Forge")) {
+                ImGui::Text("Version: %s", "1.5.1");
+                ImGui::SeparatorText("Developers");
+                ImGui::BulletText("Fexty");
+                ImGui::BulletText("jeffi2287");
+
+                ImGui::SeparatorText("Libraries Used");
+                ImGui::BulletText("devkitARM/libnx (32-bit)");
+                ImGui::BulletText("NNSDK");
+                ImGui::BulletText("switch-tools");
+                ImGui::BulletText("iniparser");
+                ImGui::BulletText("Dear ImGui");
+            }
+            if (ImGui::CollapsingHeader("Loaded Plugins")) {
+                const char *names[16];
+                int n = forge_plugin_titles(names, 16);
+                for (int i = 0; i < n; i++) ImGui::BulletText("%s", names[i]);
+            }
+            if (ImGui::CollapsingHeader("Plugin UI")) forge_imgui_run(cpu, FORGE_IMGUI_RENDER);
+            // (by touch: a finger dragged up or down scrolls the window, as a phone's lists do - from its background, a
+            // header, a button or a box: the press is let go, so nothing is clicked when the finger lifts; a slider or a
+            // field the press already changed keeps the finger. A press on the window's background makes its move id the
+            // active one, which moves nothing off the title bar)
+            static bool scrolling;
+            if (!touch_ui || !io.MouseDown[ImGuiMouseButton_Left]) scrolling = false;
+            if (touch_ui && !scrolling &&
+                ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                ImGui::IsMouseDragging(ImGuiMouseButton_Left, 10 * scale)) {
+                ImVec2 d = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 0);
+                ImGuiID active = ImGui::GetActiveID();
+                bool background = !active || (GImGui->ActiveIdWindow && active == GImGui->ActiveIdWindow->MoveId);
+                if (fabsf(d.y) > fabsf(d.x) && (background || !GImGui->ActiveIdHasBeenEditedBefore)) {
+                    scrolling = true;
+                    if (active) ImGui::ClearActiveID();
+                    LOG("[overlay] forge's menu scrolled by a finger (%.0f of %.0f)\n", ImGui::GetScrollY(), ImGui::GetScrollMaxY());
+                }
+            }
+            if (scrolling) ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseDelta.y);
+        }
+        ImGui::End();
+        if (!keep) set_open(false);
+    }
+    if (touch_ui) {
+        ImGui::PopStyleVar(7);
+        ImGui::PopFont();
+        ImGui::GetStyle().TouchExtraPadding = ImVec2(0, 0);  // (the settings menu and the plugins' free drawing: none)
+    }
+    g_forge_typing.store(g_forge_open && !g_settings_open && io.WantTextInput, std::memory_order_relaxed);
+    forge_imgui_run(cpu, FORGE_IMGUI_FREE_RENDER);
+    if (notice && !g_modal_open) draw_notice(now, scale);  // (not over the thank-you: it waits, notice_hold)
+    if (plate && !g_modal_open && !g_settings_open) draw_plate(plate_title, plate_text, plate_alpha, scale);
+    if (chat && !g_modal_open) draw_chat(line, now, scale);
+    if (stats) perfstats_draw((float)w, (float)h);  // (under the touch controls, on the same background list)
+    if (touch) touch_draw((float)w, (float)h);  // (the touch controls: runtime/touch.cpp)
+    if (chat_over) chat_port_draw((float)w, (float)h);  // (over them: the chat button, the last lines)
+    ImGui::Render();
+    settings_panel_after_render(ImGui::GetDrawData());
+
+    ImDrawData *dd = ImGui::GetDrawData();
+    bool uploaded = false;
+    if (dd->Textures)  // (texture uploads: on this thread, between the render thread's submissions)
+        for (ImTextureData *tex : *dd->Textures)
+            if (tex->Status != ImTextureStatus_OK) {
+                vk_lock();
+                uint64_t t0 = HITCH_ON ? hitch_now() : 0;
+                ImGui_ImplVulkan_UpdateTexture(tex);
+                if (HITCH_ON) hitch_add(HC_OVERLAY_TEX, hitch_now() - t0, (uint64_t)tex->Width * tex->Height * 4);
+                vk_unlock();
+                uploaded = true;
+            }
+    std::lock_guard<std::mutex> l(g_snap_lock);
+    if (uploaded || !g_snap_compare || !snap_same(dd)) g_snap_seq++;  // (MHGU_PERF_MENU_PRESENT: a new picture)
+    if (same && !snap_same(dd) && g_reuse_bad++ < 20)  // (MHGU_PERF_OVERLAY_REUSE=2: the frame drawn again would differ)
+        LOG("[perf] overlay reuse check: a frame the key took as unchanged differs (%d lists, %d vertices; before %d, %d)\n",
+            dd->CmdListsCount, dd->TotalVtxCount, g_snap.CmdListsCount, g_snap.TotalVtxCount);
+    g_reuse_last = alone && !uploaded, g_reuse_w = w, g_reuse_h = h, g_reuse_built_ns = now;
+    snap_clear();
+    for (ImDrawList *list : dd->CmdLists) g_snap.CmdLists.push_back(list->CloneOutput());
+    g_snap.CmdListsCount = dd->CmdListsCount;
+    g_snap.TotalIdxCount = dd->TotalIdxCount;
+    g_snap.TotalVtxCount = dd->TotalVtxCount;
+    g_snap.DisplayPos = dd->DisplayPos;
+    g_snap.DisplaySize = dd->DisplaySize;
+    g_snap.FramebufferScale = dd->FramebufferScale;
+    g_snap.Textures = nullptr;  // (done above)
+    g_snap.Valid = true;
+    g_snap_gen++;
+}
+
+// ------------------------------------------------------------------ drawing (render thread)
+static VkRenderPass g_pass;
+
+static void vk_check(VkResult r) {
+    if (r < 0) LOG("[forge] ImGui Vulkan error %d\n", (int)r);
+}
+
+void overlay_draw(VkCommandBuffer cb, const OverlayTarget *t) {
+#ifndef MHGU_NULL_BACKEND
+    if (!g_enabled) return;
+    g_disp_w = t->width, g_disp_h = t->height;
+    if (t->pass != g_pass) {  // (the window's render pass: made once, again only if the window's format changes)
+        if (g_pass) {
+            g_ready = false;
+            ImGui_ImplVulkan_Shutdown();
+        }
+        ImGui_ImplVulkan_InitInfo info = {};
+        info.ApiVersion = VK_API_VERSION_1_2;
+        info.Instance = t->inst;
+        info.PhysicalDevice = t->phys;
+        info.Device = t->dev;
+        info.QueueFamily = t->qfam;
+        info.Queue = t->queue;
+        info.PipelineCache = t->cache;
+        info.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE * 2;
+        info.MinImageCount = 2;
+        info.ImageCount = 8;  // (vertex buffers in turn: more than the frames ever in flight)
+        info.PipelineInfoMain.RenderPass = t->pass;
+        info.PipelineInfoMain.Subpass = 0;
+        info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        info.CheckVkResultFn = vk_check;
+        if (!ImGui_ImplVulkan_Init(&info)) {
+            LOG("[forge] ImGui's Vulkan renderer did not start: no overlay\n");
+            g_enabled = false;
+            return;
+        }
+        g_pass = t->pass;
+        g_ready = true;
+    }
+    std::lock_guard<std::mutex> l(g_snap_lock);
+    if (!g_snap.Valid || !g_snap.CmdListsCount) return;
+    if (!t->turn) {
+        ImGui_ImplVulkan_RenderDrawData(&g_snap, cb);
+        return;
+    }
+    // The window image drawn turned for the panel (nvn/vulkan/device.c, MHGU_PERF_PREROTATE): a turned copy of the
+    // snapshot, made once for each (its vertices and clip rectangles a quarter turn round, onto the image's own size)
+    static ImDrawData rot;
+    static uint32_t rot_gen;
+    static int rot_turn;
+    if (!rot.Valid || rot_gen != g_snap_gen || rot_turn != t->turn) {
+        for (ImDrawList *d : rot.CmdLists) IM_DELETE(d);
+        rot.CmdLists.resize(0);
+        float w = g_snap.DisplaySize.x, h = g_snap.DisplaySize.y, ox = g_snap.DisplayPos.x, oy = g_snap.DisplayPos.y;
+        bool r90 = t->turn == 1;  // (else 270)
+        // The scissor of each command: the pixels ImGui's backend would take for it upright (the clip rectangle clamped
+        // to the picture, its start and its size each cut to whole pixels: a start of 252.5 and an end of 600.4 are
+        // columns 252 to 599), turned. Turned before it is cut, a clip rectangle that isn't on whole pixels took a column
+        // more or less than upright: at 270 degrees 262 pixels of the settings menu's list and text differed.
+        float sx = g_snap.FramebufferScale.x > 0 ? g_snap.FramebufferScale.x : 1, sy = g_snap.FramebufferScale.y > 0 ? g_snap.FramebufferScale.y : 1;
+        float fw = w * sx, fh = h * sy;  // (the picture's size in pixels, upright)
+        for (ImDrawList *src : g_snap.CmdLists) {
+            ImDrawList *d = src->CloneOutput();
+            for (ImDrawVert &v : d->VtxBuffer) {
+                float x = v.pos.x - ox, y = v.pos.y - oy;
+                v.pos = r90 ? ImVec2(h - y, x) : ImVec2(y, w - x);
+            }
+            for (ImDrawCmd &c : d->CmdBuffer) {
+                float x1 = (c.ClipRect.x - ox) * sx, y1 = (c.ClipRect.y - oy) * sy;  // (as imgui_impl_vulkan.cpp does)
+                float x2 = (c.ClipRect.z - ox) * sx, y2 = (c.ClipRect.w - oy) * sy;
+                x1 = x1 < 0 ? 0 : x1, y1 = y1 < 0 ? 0 : y1, x2 = x2 > fw ? fw : x2, y2 = y2 > fh ? fh : y2;
+                if (x2 <= x1 || y2 <= y1) {
+                    c.ClipRect = ImVec4(0, 0, 0, 0);  // (nothing: skipped there too)
+                    continue;
+                }
+                float X0 = (float)(int32_t)x1, Y0 = (float)(int32_t)y1, X1 = X0 + (float)(uint32_t)(x2 - x1), Y1 = Y0 + (float)(uint32_t)(y2 - y1);
+                ImVec4 r = r90 ? ImVec4(fh - Y1, X0, fh - Y0, X1) : ImVec4(Y0, fw - X1, Y1, fw - X0);  // (whole pixels, turned)
+                c.ClipRect = ImVec4(r.x / sy, r.y / sx, r.z / sy, r.w / sx);  // (back in its units: the turned picture's scale is (sy, sx))
+            }
+            rot.CmdLists.push_back(d);
+        }
+        rot.CmdListsCount = g_snap.CmdListsCount;
+        rot.TotalIdxCount = g_snap.TotalIdxCount;
+        rot.TotalVtxCount = g_snap.TotalVtxCount;
+        rot.DisplayPos = ImVec2(0, 0);
+        rot.DisplaySize = ImVec2(h, w);
+        rot.FramebufferScale = ImVec2(sy, sx);
+        rot.Textures = nullptr;
+        rot.Valid = true;
+        rot_gen = g_snap_gen, rot_turn = t->turn;
+    }
+    ImGui_ImplVulkan_RenderDrawData(&rot, cb);
+#endif
+}
