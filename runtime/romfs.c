@@ -144,6 +144,43 @@ static void sort_tree(Dir *d) {
     for (int i = 0; i < d->ndirs; i++) sort_tree(d->dirs[i]);
 }
 
+// Release the in-memory directory tree after the RomFS tables and file offsets are built.
+// Runtime reads only need each File's host path, virtual data offset, size and RomFS path.
+static void free_scan_tree(Dir *d) {
+    for (int i = 0; i < d->nfiles; i++) {
+        File *f = d->files[i];
+        free(f->name);
+        f->name = NULL;
+        free(f->orig);
+        f->orig = NULL;
+        f->parent = NULL;
+    }
+    for (int i = 0; i < d->ndirs; i++) free_scan_tree(d->dirs[i]);
+    free(d->name);
+    d->name = NULL;
+    free(d->dirs);
+    d->dirs = NULL;
+    free(d->files);
+    d->files = NULL;
+    free(d);
+}
+
+static void free_overlay_tree(Dir *d) {
+    for (int i = 0; i < d->nfiles; i++) {
+        File *f = d->files[i];
+        free(f->name);
+        free(f->path);
+        free(f->orig);
+        free(f->rpath);
+        free(f);
+    }
+    for (int i = 0; i < d->ndirs; i++) free_overlay_tree(d->dirs[i]);
+    free(d->name);
+    free(d->dirs);
+    free(d->files);
+    free(d);
+}
+
 typedef struct { Dir **dirs; File **files; int nd, nf, cd, cf; } Lists;
 static void flatten(Dir *d, Lists *l) {
     for (int i = 0; i < d->nfiles; i++) {
@@ -243,6 +280,7 @@ static bool build(RomfsImage *im, const char *base_dir, const char *const *overl
         if (tex) LOG(", %d of them textures (%.1f MB as files; the GPU memory they take grows as they are drawn: the [mem] lines)",
                      tex, tex_bytes / 1048576.0);
         LOG("\n");
+        free_overlay_tree(o);
     }
     sort_tree(root);
     Lists l = {0};
@@ -309,6 +347,7 @@ static bool build(RomfsImage *im, const char *base_dir, const char *const *overl
     im->files = l.files;  // (flatten order is data order)
     im->nfiles = l.nf;
     free(l.dirs);
+    free_scan_tree(root);
     LOG("[romfs] %d files, %d folders, image %.1f GB\n", l.nf, l.nd, im->size / 1e9);
     if (!game) return true;
     // (version 1.4.0's is 12.3 GB, 1.4 of them its movies, and none of its files is empty. A copy cut short, with every
@@ -355,7 +394,11 @@ uint64_t romfs_size(void) { return g_main.size; }
 uint64_t romfs_image_size(const RomfsImage *im) { return im->size; }
 
 // ---- host file descriptors (a small cache: the image has tens of thousands of files)
+#ifdef MHGU_IOS
+#define FDC 16
+#else
 #define FDC 64
+#endif
 static struct { File *f; int fd; uint64_t used; } fdc[FDC];
 static uint64_t fdc_clock;
 static pthread_mutex_t fdc_lock = PTHREAD_MUTEX_INITIALIZER;

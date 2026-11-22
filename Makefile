@@ -26,7 +26,9 @@ CC       := clang
 CXX      := clang++
 # AVX2 + FMA (Haswell or newer); Android: the ABI's baseline (arm64-v8a: ARMv8.0, x86_64: SSE4.2)
 GENARCH  ?= $(if $(ANDROID)$(filter darwin,$(PLATFORM)),,-march=x86-64-v3)
-GENOPT   ?= -O1
+# iOS builds use the same optimization level as the release workflow. The
+# generated game code is the hottest part of the executable.
+GENOPT   ?= $(if $(filter darwin,$(PLATFORM)),-O2,-O1)
 GENFLAGS := $(GENOPT) -fno-strict-aliasing -ffp-contract=off -fno-math-errno -Wno-return-type -Wno-unused-label \
             -Wno-parentheses-equality -Wno-unused-value -fvisibility=hidden -Iruntime $(GENARCH)
 

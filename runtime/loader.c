@@ -1,6 +1,9 @@
 // NSO loading (AArch32 modules), REL relocation and symbol resolution.
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "interp.h"
 #include "mods.h"
@@ -208,9 +211,15 @@ static void replace_from_mod(Module *m, const uint32_t seg[3][3], uint32_t bss) 
 }
 
 static void load_nso(Module *m, const char *path, uint32_t base) {
-    size_t len;
-    uint8_t *raw = read_file(path, &len);
-    if (!raw || len < 0x100 || memcmp(raw, "NSO0", 4)) FATAL("cannot load %s\n", path);
+    FILE *f = fopen(path, "rb");
+    if (!f) FATAL("cannot load %s\n", path);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); FATAL("cannot load %s\n", path); }
+    long file_len = ftell(f);
+    if (file_len < 0x100) { fclose(f); FATAL("cannot load %s\n", path); }
+    rewind(f);
+    uint8_t raw[0x100];
+    if (fread(raw, 1, sizeof raw, f) != sizeof raw || memcmp(raw, "NSO0", 4))
+        { fclose(f); FATAL("cannot load %s\n", path); }
     uint32_t flags = *(uint32_t *)(raw + 0xC);
     uint32_t seg[3][3];  // file_off, mem_off, size
     for (int i = 0; i < 3; i++) memcpy(seg[i], raw + 0x10 + i * 0x10, 12);
@@ -222,17 +231,28 @@ static void load_nso(Module *m, const char *path, uint32_t base) {
     memset(G2H(base), 0, size);
     for (int i = 0; i < 3; i++) {
         uint32_t csize = *(uint32_t *)(raw + 0x60 + i * 4);
-        if ((uint64_t)seg[i][0] + csize > len || (uint64_t)seg[i][1] + seg[i][2] > size)
+        if ((uint64_t)seg[i][0] + csize > (uint64_t)file_len ||
+            (uint64_t)seg[i][1] + seg[i][2] > size)
             FATAL("%s: segment %d is outside the file or the image\n", path, i);
         uint8_t *dst = (uint8_t *)G2H(base + seg[i][1]);
         if (flags & (1 << i)) {
-            size_t got = lz4_decompress(raw + seg[i][0], csize, dst, seg[i][2]);
+            uint8_t *packed = malloc(csize);
+            if (!packed) { fclose(f); FATAL("cannot allocate the %s NSO segment\n", path); }
+            if (fseek(f, seg[i][0], SEEK_SET) != 0 ||
+                fread(packed, 1, csize, f) != csize) {
+                free(packed); fclose(f); FATAL("cannot read %s segment %d\n", path, i);
+            }
+            size_t got = lz4_decompress(packed, csize, dst, seg[i][2]);
+            free(packed);
             if (got != seg[i][2]) FATAL("lz4 %s seg %d: %zu != %u\n", path, i, got, seg[i][2]);
         } else {
-            memcpy(dst, raw + seg[i][0], seg[i][2]);
+            if (fseek(f, seg[i][0], SEEK_SET) != 0 ||
+                fread(dst, 1, seg[i][2], f) != seg[i][2]) {
+                fclose(f); FATAL("cannot read %s segment %d\n", path, i);
+            }
         }
     }
-    free(raw);
+    fclose(f);
     m->base = base;
     m->size = size;
     m->text_off = seg[0][1]; m->text_size = seg[0][2];

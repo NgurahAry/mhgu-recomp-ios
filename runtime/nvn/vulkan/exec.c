@@ -787,14 +787,18 @@ static bool memory_short(uint64_t now) {
 #endif
 
 static void staging_trim(void) {
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__APPLE__)
     static uint64_t next;
     static int on = -1;
     if (on < 0) { const char *e = getenv("MHGU_VK_STAGING_TRIM"); on = !e || atoi(e) != 0; }
     uint64_t now = plat_now_ns();
     if (!on || (now < next && !trim_now) || nchunks <= 1) return;
     next = now + 1000000000ull;
-    uint64_t done = vk_completed_seq(), freed = 0, idle = trim_now ? 0 : memory_short(now) ? 2000000000ull : STAGING_IDLE_NS;
+    uint64_t done = vk_completed_seq(), freed = 0, idle = trim_now ? 0 :
+#ifdef __ANDROID__
+        memory_short(now) ? 2000000000ull :
+#endif
+        STAGING_IDLE_NS;
     int n = 0;
     for (int i = nchunks - 1; i >= 0 && nchunks > 1; i--) {
         Chunk *c = &chunks[i];
@@ -902,6 +906,9 @@ static uint64_t vc_budget(void) {
 #ifdef __ANDROID__
         uint64_t ram = vk_ram_mb();
         mb = ram <= 3200 ? 128 : ram <= 4400 ? 192 : 384;
+#elif defined(MHGU_IOS)
+        uint64_t ram = vk_ram_mb();
+        mb = ram <= 3200 ? 128 : ram <= 4400 ? 192 : 384;
 #endif
         if (e && atoi(e) > 0) mb = (uint64_t)atoi(e);
         b = mb << 20;
@@ -921,7 +928,7 @@ static uint64_t vc_budget(void) {
 #define VC_HOT_FRAMES 4
 static uint64_t vc_ceiling(void) {
     uint64_t b = VC_BUDGET;
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(MHGU_IOS)
     uint64_t top = 384ull << 20;
     return b >= top ? b : b * 2 < top ? b * 2 : top;
 #else  // (a desktop keeps 384 MB: vc_trim, which brings it back, is a phone's)
@@ -930,7 +937,7 @@ static uint64_t vc_ceiling(void) {
 }
 #define VC_IDLE_NS 20000000000ull
 #define VC_FULL_NS 2000000000ull
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(MHGU_IOS)
 #define VC_SLICE (2ull << 20)
 #else
 #define VC_SLICE (1ull << 20)
@@ -1071,7 +1078,7 @@ static void vc_drop(VcEnt *e);
 // (phones, every 2 s from vk_submit_extra) entries no submission used in the last VC_IDLE_NS go: their buffers are
 // destroyed once the submissions that used them are done (vk_defer_buffer)
 static void vc_trim(void) {
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(MHGU_IOS)
     static uint64_t next, hist_t[16], hist_seq[16];
     static int nh, on = -1;
     if (on < 0) { const char *e = getenv("MHGU_VK_VC_TRIM"); on = !e || atoi(e) != 0; }
@@ -1080,7 +1087,11 @@ static void vc_trim(void) {
     next = now + 2000000000ull;
     // (the submission that was next VC_IDLE_NS ago: samples every 2 s; entries last used before it are idle)
     hist_t[nh % 16] = now, hist_seq[nh % 16] = vk_pending_seq(), nh++;
-    uint64_t before = 0, idle = trim_now ? 0 : memory_short(now) ? 2000000000ull : VC_IDLE_NS;
+    uint64_t before = 0, idle = trim_now ? 0 :
+#ifdef __ANDROID__
+        memory_short(now) ? 2000000000ull :
+#endif
+        VC_IDLE_NS;
     for (int i = 0; i < 16 && i < nh; i++)
         if (now - hist_t[i] >= idle && hist_seq[i] > before) before = hist_seq[i];
     uint64_t freed = 0;
